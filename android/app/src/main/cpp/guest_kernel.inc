@@ -56,23 +56,26 @@ void enterCritical() {
     // owner) instead of sleeping 1 ms per attempt; sleep only if it persists.
     static const bool reportLongWaits=std::getenv("NFSU2_HANG_DUMP")!=nullptr;
     auto waitStart=std::chrono::steady_clock::now();bool reported=false;
-    // The owner can only release while it holds the machine, so give the machine away and block until a
-    // critical section is left (notifyGuestSync in leaveCritical) instead of spinning.
     const bool timeIt=nfsIsGameThread();std::chrono::steady_clock::time_point csStart;bool contended=false;
-    for(uint64_t gen=guestSyncGeneration.load();!mutex->try_lock();gen=guestSyncGeneration.load()){
-        if(timeIt&&!contended){contended=true;csStart=std::chrono::steady_clock::now();}
-        if(reportLongWaits&&!reported&&std::chrono::steady_clock::now()-waitStart>std::chrono::seconds(8)){reported=true;
-            NFS_RUNTIME_LOG(ANDROID_LOG_WARN,"NFSU2","LONG WAIT guest thread %u on critical section %08x owned by guest thread %u (count %u)",guestThreadId,address,read32(address+12),read32(address+8));}
-        checkGuestProgress();waitGuestSync(gen,4,[&]{return read32(address+8)==0;});}
+    if(!mutex->try_lock()){
+        WaitScope scope("EnterCriticalSection",address);
+        for(uint64_t gen=guestSyncGeneration.load();!mutex->try_lock();gen=guestSyncGeneration.load()){
+            if(timeIt&&!contended){contended=true;csStart=std::chrono::steady_clock::now();}
+            if(reportLongWaits&&!reported&&std::chrono::steady_clock::now()-waitStart>std::chrono::seconds(8)){reported=true;
+                NFS_RUNTIME_LOG(ANDROID_LOG_WARN,"NFSU2","LONG WAIT guest thread %u on critical section %08x owned by guest thread %u (count %u)",guestThreadId,address,read32(address+12),read32(address+8));}
+            checkGuestProgress();waitGuestSync(gen,4,[&]{return read32(address+8)==0;});}
+    }
     if(findCritical(address)!=mutex){mutex->unlock();throw GuestStop("Critical section deleted while waiting");}
     if(contended){const uint64_t ns=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-csStart).count();
         nfsWaitAdd(6,ns);nfsCsWait(address,ns);}
-    auto count=read32(address+8)+1; write32(address+8,count); write32(address+4,count-1); write32(address+12,guestThreadId);ret(0,1);
+    auto count=read32(address+8)+1; write32(address+8,count); write32(address+4,count-1); write32(address+12,guestThreadId);
+    if(count==1)currentTrace().hold(address);
+    ret(0,1);
 }
 void leaveCritical() {
     uint32_t address=arg(0); auto mutex=findCritical(address); uint32_t count=read32(address+8);
     if(!mutex||!count||read32(address+12)!=guestThreadId) throw GuestStop("Unbalanced LeaveCriticalSection");
-    write32(address+8,--count);write32(address+4,count-1);if(!count)write32(address+12,0);mutex->unlock();
+    write32(address+8,--count);write32(address+4,count-1);if(!count){write32(address+12,0);currentTrace().release(address);}mutex->unlock();
     if(!count)notifyGuestSync();
     if(!count){std::lock_guard<std::mutex> l(criticalMapMutex);if(pendingCriticalDeletes.erase(address))criticalSections.erase(address);}
     ret(0,1);
@@ -99,11 +102,15 @@ void moduleHandleW() {
 std::map<uint32_t,uint32_t> moduleReferences;
 void loadLibrary(){
     auto name=lower(guestString(arg(0)));auto slash=name.find_last_of("/\\");if(slash!=std::string::npos)name=name.substr(slash+1);if(name.find('.')==std::string::npos)name+=".dll";
-    NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSU2","Guest LoadLibrary %s",name.c_str());
-    auto module=modules.find(name);if(module==modules.end()){lastError=126;ret(0,1);return;}
+    static std::set<std::string> loggedLoads;
+    if(loggedLoads.insert(name).second)
+        NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSU2","Guest LoadLibrary %s",name.c_str());
+    auto module=modules.find(name);
+    if(module==modules.end()){uint32_t loaded=loadGuestModule(name);if(!loaded)lastError=126;ret(loaded,1);return;}
     auto& count=moduleReferences[module->second];if(!count)count=1;++count;ret(module->second,1);
 }
-void freeLibrary(){auto module=std::find_if(modules.begin(),modules.end(),[](const auto& item){return item.second==arg(0);});if(module==modules.end()){lastError=6;ret(0,1);return;}
+void freeLibrary(){auto module=std::find_if(modules.begin(),modules.end(),[](const auto& item){return item.second==arg(0);});
+    if(module==modules.end()){if(freeGuestModule(arg(0))){ret(1,1);return;}lastError=6;ret(0,1);return;}
     auto found=moduleReferences.find(arg(0));if(found!=moduleReferences.end()&&found->second>1)--found->second;ret(1,1);}
 void environmentA() {
     if(!guestEnvironmentA) {std::string s="PATH=C:\\nfsu2";s.push_back(0);s+="TEMP=C:\\nfsu2";s.push_back(0);s.push_back(0);guestEnvironmentA=ansiString(s);}
@@ -196,6 +203,7 @@ void fileTimeToSystemTime(){
 void systemInfo() {uint32_t out=arg(0);std::memset(ptr(out,36),0,36);write32(out+4,4096);write32(out+8,0x10000);write32(out+12,0x7ffeffff);write32(out+16,1);write32(out+20,1);write32(out+24,586);write32(out+28,65536);uint16_t level=6;std::memcpy(ptr(out+32,2),&level,2);ret(0,1);}
 void sleepShim() {
     uint32_t ms=arg(0);if(ms==UINT32_MAX)throw GuestStop("Infinite Sleep requires guest scheduler");
+    WaitScope scope("Sleep",ms);
     if(ms&&nfsIsGameThread())nfsWaitAdd(7,uint64_t(ms)*1000000ull);
     while(ms){checkGuestProgress();auto chunk=std::min(ms,50u);yieldGuestMachine(chunk);ms-=chunk;}
     ret(0,1);
@@ -367,7 +375,12 @@ void windowRect(){
     if(arg(0)!=desktopWindow){auto window=windows.find(arg(0));if(window==windows.end()){lastError=1400;ret(0,2);return;}auto& value=window->second;rectangle[0]=value.x;rectangle[1]=value.y;rectangle[2]=value.x+value.width;rectangle[3]=value.y+value.height;}
     std::memcpy(ptr(arg(1),16),rectangle,16);ret(1,2);
 }
-void cursorPosition(){uint32_t point[2]={0,0};std::memcpy(ptr(arg(0),8),point,8);ret(1,1);}
+// Screen position of the touch pointer (the game maps it through GetWindowRect/GetClientRect).
+void cursorPosition(){
+    auto point=pointerInWindow();int32_t screen[2]={point.first,point.second};
+    if(auto window=windows.find(activeWindow);window!=windows.end()){screen[0]+=window->second.x;screen[1]+=window->second.y;}
+    std::memcpy(ptr(arg(0),8),screen,8);ret(1,1);
+}
 void clientRect(){auto window=windows.find(arg(0));if(window==windows.end()){lastError=1400;ret(0,2);return;}int32_t rect[4]={0,0,window->second.width,window->second.height};std::memcpy(ptr(arg(1),16),rect,16);ret(1,2);}
 void loadIcon(){lastError=1813;ret(0,2);} // PE icon resources are not materialized as Android objects.
 void loadCursor(){
@@ -387,7 +400,18 @@ void systemMetrics(){
     }
     ret(value,1);
 }
+// MessageBoxA(hwnd, text, caption, type): no dialog on Android. The text goes to
+// the log (tester reports) and the box answers its default button.
+void messageBox(){
+    auto text=guestString(arg(1)),caption=guestString(arg(2));uint32_t type=arg(3)&0xf;
+    NFS_RUNTIME_LOG(ANDROID_LOG_WARN,"NFSU2","Guest MessageBoxA from %08x: [%s] %s",g_cur_func,caption.c_str(),text.c_str());
+    // MB_OK/OKCANCEL -> IDOK, ABORTRETRYIGNORE -> IDIGNORE, YESNO(CANCEL) -> IDYES,
+    // RETRYCANCEL -> IDCANCEL, CANCELTRYCONTINUE -> IDCONTINUE.
+    static constexpr uint32_t answers[]={1,1,5,6,6,2,11};
+    ret(type<7?answers[type]:1,4);
+}
 const std::map<std::string,recomp_func_t> windowFunctions={
+    {"MessageBoxA",messageBox},
     {"PeekMessageA",peekMessage},{"GetMessageA",getMessage},{"TranslateMessage",translateMessage},{"DispatchMessageA",dispatchMessage},
     {"PostMessageA",postMessage},{"PostQuitMessage",postQuitMessage},{"SendMessageA",sendMessage},
     {"wvsprintfA",winFormatA},
@@ -400,8 +424,14 @@ const std::map<std::string,recomp_func_t> windowFunctions={
     {"GetWindowLongA",getWindowLong},{"SetWindowLongA",setWindowLong},
     {"LoadIconA",loadIcon},{"LoadCursorA",loadCursor},
     {"GetDesktopWindow",desktopHandle},{"GetWindowRect",windowRect},
+    {"SetCapture",setCapture},{"ReleaseCapture",releaseCapture},
     {"GetClientRect",clientRect},{"GetCursorPos",cursorPosition},{"GetSystemMetrics",systemMetrics}
 };
+// Guest threads run one at a time under the machine lock, so plain accesses are atomic to them.
+void interlockedExchange(){uint32_t target=arg(0),old=read32(target);write32(target,arg(1));ret(old,2);}
+void interlockedIncrement(){uint32_t target=arg(0),value=read32(target)+1;write32(target,value);ret(value,1);}
+void interlockedDecrement(){uint32_t target=arg(0),value=read32(target)-1;write32(target,value);ret(value,1);}
+void interlockedCompareExchange(){uint32_t target=arg(0),old=read32(target);if(old==arg(2))write32(target,arg(1));ret(old,3);}
 const std::map<std::string,recomp_func_t> kernelFunctions={
     {"IsBadReadPtr",isBadReadPtr},{"IsBadWritePtr",isBadWritePtr},{"VirtualProtect",virtualProtect},
     {"CreateMutexA",createMutex},{"ReleaseMutex",releaseMutex},
@@ -411,7 +441,8 @@ const std::map<std::string,recomp_func_t> kernelFunctions={
     {"LoadLibraryA",loadLibrary},{"FreeLibrary",freeLibrary},
     {"SetErrorMode",setErrorMode},
     {"CreateEventA",createEvent},{"SetEvent",setEvent},{"ResetEvent",resetEvent},
-    {"CreateThread",createThread},{"ResumeThread",resumeThread},{"GetExitCodeThread",threadExitCode},{"WaitForSingleObject",waitThread},{"SetThreadPriority",setThreadPriority},
+    {"CreateThread",createThread},{"ResumeThread",resumeThread},{"GetExitCodeThread",threadExitCode},{"WaitForSingleObject",waitThread},{"WaitForMultipleObjects",waitMultiple},{"ExitThread",exitThread},
+    {"InterlockedExchange",interlockedExchange},{"InterlockedIncrement",interlockedIncrement},{"InterlockedDecrement",interlockedDecrement},{"InterlockedCompareExchange",interlockedCompareExchange},{"SetThreadPriority",setThreadPriority},
     {"CreateToolhelp32Snapshot",toolhelpSnapshot},{"Module32First",moduleFirst},{"Module32Next",moduleNext},{"CloseHandle",closeHandle},
     {"Process32First",processFirst},{"Process32Next",processNext},
     {"DuplicateHandle",duplicateHandle},

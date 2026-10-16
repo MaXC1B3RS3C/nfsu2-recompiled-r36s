@@ -1,5 +1,6 @@
 #pragma once
 #include <string>
+#include <vector>
 // Maps the owner's PE data, binds imports, tests lifted code and attempts CRT
 // entry until the first unsupported host service. Returns an honest status.
 std::string connectGuestRuntime(const char* executable);
@@ -17,6 +18,11 @@ void setGuestPadConnected(bool connected);
 bool guestGamepadInUse();
 // Launcher option; only before the guest boots.
 void setGuestWidescreen(bool enabled);
+void setGuestOnlineServer(const std::string& host);
+/** Touch as mouse: x/y as a fraction of the game view; phase 0 down, 1 move, 2 up (left button). */
+void setGuestPointer(float x,float y,int phase);
+/** Posts WM_CHAR messages (the game's text fields read those); 8 is backspace. */
+void typeGuestText(const std::vector<uint32_t>& characters);
 void setGuestLanguage(const char* language);
 void setGuestResolution(unsigned width,unsigned height);
 void setGuestFrameLimit(unsigned framesPerSecond);

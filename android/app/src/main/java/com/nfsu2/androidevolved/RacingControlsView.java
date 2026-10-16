@@ -24,10 +24,15 @@ import java.util.HashMap;
  */
 final class RacingControlsView extends View {
     interface Keys { void set(int scan, boolean down); }
+    /** Touches outside every control drive the game's mouse: x/y as fractions of the view, phase 0 down, 1 move, 2 up. */
+    interface Pointer { void touch(float x, float y, int phase); }
     // Special controls that do not map to a DirectInput scan code.
     private static final int MODE = -1, TEXT = -2, STICK = -3, EDIT = -5;
     private static final int ROUND = 0, PEDAL = 1, WHEEL = 2;
     private final Keys keys;
+    private Pointer pointer;
+    private int pointerId=-1;
+    private float pointerX, pointerY;
     private final Runnable textInput;
     private final Runnable configureTilt;
     private final Runnable configureFrameLimit;
@@ -42,6 +47,7 @@ final class RacingControlsView extends View {
     private boolean lastGameMode;
     private boolean editing;
     private boolean hiddenByGamepad;
+    private boolean gamepadConnected;
     private Control selected;
     private int dragPointer = -1;
     private float dragX, dragY;
@@ -94,8 +100,10 @@ final class RacingControlsView extends View {
     boolean isDriving() {return racing&&!editing&&!hiddenByGamepad;}
     /** A physical gamepad is connected: get out of the way until the screen is touched. */
     void setGamepadConnected(boolean connected) {
-        if(hiddenByGamepad==connected||editing)return;
-        hiddenByGamepad=connected;releaseAll();
+        if(gamepadConnected==connected)return;
+        gamepadConnected=connected;
+        hiddenByGamepad=connected&&!editing;
+        releaseAll();
     }
     private void layoutControls() {
         releaseAll(); controls.clear();selected=null;dragPointer=-1;
@@ -106,6 +114,10 @@ final class RacingControlsView extends View {
         add(w-118,16,46,racing?"menu":"wheel",MODE);
         if(racing) {
             add(16,16,46,"pause",1);
+            // Free-roam actions of the PC keyboard defaults (Opciones > Controles).
+            add(72,16,46,"map",0x32);     // Mapa del mundo: M
+            add(128,16,46,"sms",0x0f);    // Leer SMS: Tab
+            add(184,16,46,"reset",0x13);  // Reiniciar coche: R
             if(style.equals("classic")) {
                 add(20,bottom-92,92,"left",0xcb);
                 add(124,bottom-92,92,"right",0xcd);
@@ -233,6 +245,20 @@ final class RacingControlsView extends View {
             case "nitro": glyph(canvas,"N₂O",cx,cy,s*.9f,on);break;
             case "accept":
                 path.reset();path.moveTo(cx-s*.7f,cy);path.lineTo(cx-s*.15f,cy+s*.55f);path.lineTo(cx+s*.75f,cy-s*.5f);
+                canvas.drawPath(path,line);break;
+            case "map":
+                path.reset();path.moveTo(cx-s*.9f,cy-s*.55f);path.lineTo(cx-s*.3f,cy-s*.8f);path.lineTo(cx+s*.3f,cy-s*.55f);
+                path.lineTo(cx+s*.9f,cy-s*.8f);path.lineTo(cx+s*.9f,cy+s*.55f);path.lineTo(cx+s*.3f,cy+s*.8f);
+                path.lineTo(cx-s*.3f,cy+s*.55f);path.lineTo(cx-s*.9f,cy+s*.8f);path.close();canvas.drawPath(path,line);
+                canvas.drawLine(cx-s*.3f,cy-s*.8f,cx-s*.3f,cy+s*.55f,line);canvas.drawLine(cx+s*.3f,cy-s*.55f,cx+s*.3f,cy+s*.8f,line);break;
+            case "sms":
+                canvas.drawRoundRect(cx-s*.9f,cy-s*.7f,cx+s*.9f,cy+s*.4f,s*.25f,s*.25f,line);
+                path.reset();path.moveTo(cx-s*.45f,cy+s*.4f);path.lineTo(cx-s*.6f,cy+s*.85f);path.lineTo(cx-s*.05f,cy+s*.4f);
+                canvas.drawPath(path,line);
+                for(int dot=-1;dot<=1;++dot)canvas.drawCircle(cx+dot*s*.4f,cy-s*.15f,s*.1f,fill);break;
+            case "reset":
+                canvas.drawArc(cx-s*.75f,cy-s*.75f,cx+s*.75f,cy+s*.75f,-60,290,false,line);
+                path.reset();path.moveTo(cx+s*.2f,cy-s*.95f);path.lineTo(cx+s*.55f,cy-s*.62f);path.lineTo(cx+s*.08f,cy-s*.42f);
                 canvas.drawPath(path,line);break;
             case "back":
                 canvas.drawLine(cx-s*.5f,cy-s*.5f,cx+s*.5f,cy+s*.5f,line);canvas.drawLine(cx+s*.5f,cy-s*.5f,cx-s*.5f,cy+s*.5f,line);break;
@@ -387,7 +413,13 @@ final class RacingControlsView extends View {
         c.steering=Math.max(-1,Math.min(1,(x/scale-c.area.centerX())/(c.area.width()/2)));
         keys.set(0xcb,c.steering<-.18f);keys.set(0xcd,c.steering>.18f);
     }
-    void releaseAll() { for(Control c:fingers.values()) release(c); fingers.clear(); invalidate(); }
+    void setPointer(Pointer pointer) { this.pointer=pointer; }
+    private void pointerTouch(float x,float y,int phase) {
+        if(pointer==null||getWidth()==0||getHeight()==0)return;
+        pointerX=x;pointerY=y;pointer.touch(x/getWidth(),y/getHeight(),phase);
+    }
+    private void pointerRelease() { if(pointerId>=0){pointerId=-1;pointerTouch(pointerX,pointerY,2);} }
+    void releaseAll() { for(Control c:fingers.values()) release(c); fingers.clear(); pointerRelease(); invalidate(); }
     @Override public boolean onTouchEvent(MotionEvent e) {
         if(editing)return editTouch(e);
         int action=e.getActionMasked(),index=e.getActionIndex(),id=e.getPointerId(index);
@@ -398,10 +430,13 @@ final class RacingControlsView extends View {
         if(action==MotionEvent.ACTION_CANCEL) { releaseAll(); return true; }
         if(action==MotionEvent.ACTION_DOWN||action==MotionEvent.ACTION_POINTER_DOWN) {
             Control c=hit(e.getX(index),e.getY(index));if(c!=null&&c.scan==STICK&&c.held>0)c=null;
+            if(c==null&&pointerId<0&&hit(e.getX(index),e.getY(index))==null){pointerId=id;pointerTouch(e.getX(index),e.getY(index),0);}
             fingers.put(id,c);hold(c);if(c!=null&&c.scan==STICK)steer(c,e.getX(index));
         } else if(action==MotionEvent.ACTION_MOVE) {
             for(int i=0;i<e.getPointerCount();++i) {
-                int pointer=e.getPointerId(i); Control old=fingers.get(pointer),next=hit(e.getX(i),e.getY(i));
+                int pointer=e.getPointerId(i);
+                if(pointer==pointerId){pointerTouch(e.getX(i),e.getY(i),1);continue;}
+                Control old=fingers.get(pointer),next=hit(e.getX(i),e.getY(i));
                 if(old!=null&&old.scan==STICK) {steer(old,e.getX(i));continue;}
                 // Menu-style buttons do not slide; pedals and arrows follow the thumb.
                 if(old!=null&&old.scan<0)continue;
@@ -409,6 +444,7 @@ final class RacingControlsView extends View {
                 if(old!=next) {release(old);fingers.put(pointer,next);hold(next);if(next!=null&&next.scan==STICK)steer(next,e.getX(i));}
             }
         } else if(action==MotionEvent.ACTION_UP||action==MotionEvent.ACTION_POINTER_UP) {
+            if(id==pointerId){pointerId=-1;pointerTouch(e.getX(index),e.getY(index),2);}
             Control c=fingers.remove(id); release(c);
             if(c!=null && c==hit(e.getX(index),e.getY(index))) {
                 if(c.scan==MODE) {racing=!racing;layoutControls();}

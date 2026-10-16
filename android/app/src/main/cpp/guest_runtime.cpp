@@ -1,9 +1,11 @@
+#include <set>
 #include <condition_variable>
 #include "guest_runtime.h"
 #include "android_resolution.h"
 #include "guest_memory.h"
 #include "guest_heap.h"
 #include "runtime_log.h"
+#include "frame_pacer.h"
 #if defined(__ANDROID__) || defined(NFS_D3D9_BACKEND)
 #include "d3d9_bridge.h"
 #include "nfs_widescreen.h"
@@ -178,6 +180,10 @@ public:
         lock();
         std::lock_guard<std::mutex> l(m_);depth_=depth;
     }
+    bool hasWaiters(){
+        std::lock_guard<std::mutex> lock(m_);
+        return next_>serving_+1; // the current owner already holds one ticket
+    }
     void unlock(){
         {
             std::lock_guard<std::mutex> l(m_);
@@ -210,13 +216,68 @@ bool timerTestActive=false;std::vector<uint32_t> timerTestCalls;
 constexpr uint32_t timerTestAddress=0x7b000010u;
 bool generatedTestActive=false;unsigned generatedTestCalls=0;
 constexpr uint32_t generatedTestTarget=0x7b000020u;
-void yieldGuestMachine(unsigned milliseconds=0) {
+uint32_t read32(uint32_t va);
+// Stall diagnostics: where each guest thread last handed the machine over and
+// what it was waiting for, dumped when the game stops presenting frames.
+struct GuestThreadTrace {
+    std::atomic<uint32_t> func{0},handle{0},esp{0};std::atomic<const char*> wait{nullptr};
+    std::array<std::atomic<uint32_t>,8> held{};  // critical sections this thread owns (outermost entries)
+    void hold(uint32_t cs){for(auto& slot:held){uint32_t empty=0;if(slot.compare_exchange_strong(empty,cs))return;}}
+    void release(uint32_t cs){for(auto& slot:held){uint32_t value=cs;if(slot.compare_exchange_strong(value,0))return;}}
+};
+std::mutex threadTracesMutex;
+std::map<uint32_t,std::shared_ptr<GuestThreadTrace>> threadTraces;
+thread_local std::shared_ptr<GuestThreadTrace> threadTrace;
+GuestThreadTrace& currentTrace(){
+    if(!threadTrace){threadTrace=std::make_shared<GuestThreadTrace>();std::lock_guard<std::mutex> lock(threadTracesMutex);threadTraces[guestThreadId]=threadTrace;}
+    return *threadTrace;
+}
+void forgetThreadTrace(){std::lock_guard<std::mutex> lock(threadTracesMutex);threadTraces.erase(guestThreadId);threadTrace.reset();}
+struct WaitScope {
+    WaitScope(const char* what,uint32_t handle){auto& trace=currentTrace();trace.wait=what;trace.handle=handle;}
+    ~WaitScope(){currentTrace().wait=nullptr;}
+};
+std::atomic<int64_t> lastPresentMs{0};
+int64_t steadyMs(){return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();}
+void startStallWatch(){
+    static std::once_flag started;
+    std::call_once(started,[]{std::thread([]{
+        int64_t reportedFor=0;
+        while(!stopRequested.load()){
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+            int64_t last=lastPresentMs.load(),idle=steadyMs()-last;
+            if(guestPaused.load()||idle<12000||reportedFor==last)continue;
+            reportedFor=last;
+            NFS_RUNTIME_LOG(ANDROID_LOG_WARN,"NFSU2","Guest stall: no frame for %lld s; guest threads:",static_cast<long long>(idle/1000));
+            std::lock_guard<std::mutex> lock(threadTracesMutex);
+            for(auto& [id,trace]:threadTraces){
+                const char* wait=trace->wait.load();uint32_t handle=trace->handle.load();
+                std::string detail,held,callers;
+                // Read-only peeks at guest memory from this host thread: stable while the guest is stuck.
+                if(wait&&!std::strcmp(wait,"EnterCriticalSection")&&memory&&memory->readable(handle,24))
+                    detail=" (owner thread "+std::to_string(read32(handle+12))+", count "+std::to_string(read32(handle+8))+")";
+                for(auto& slot:trace->held)if(uint32_t cs=slot.load())held+=" "+hex(cs);
+                uint32_t esp=trace->esp.load();
+                for(unsigned i=0,found=0;memory&&i<256&&found<10;++i){
+                    if(!memory->readable(esp+i*4,4))break;
+                    uint32_t value=read32(esp+i*4);
+                    if(value>=0x401000u&&value<0x75d000u&&recomp_lookup(value)==nullptr){callers+=" "+hex(value);++found;}
+                }
+                NFS_RUNTIME_LOG(ANDROID_LOG_WARN,"NFSU2","  thread %u at %08x %s %08x%s; holds:%s; stack:%s",id,trace->func.load(),
+                    wait?wait:"running",wait?handle:0u,detail.c_str(),held.empty()?" none":held.c_str(),callers.c_str());
+            }
+        }
+    }).detach();});
+}
+void yieldGuestMachine(unsigned milliseconds=0,std::chrono::steady_clock::time_point deadline={}) {
     if(parallelGuest&&!machine.heldByMe()){if(milliseconds)std::this_thread::sleep_for(std::chrono::milliseconds(milliseconds));return;}
     if(!machineLease||!machineLease->owns_lock())throw GuestStop("Guest scheduler ownership missing");
     // Nothing queued for the machine: a plain yield would only cost an unlock, a syscall and a relock.
     if(!milliseconds&&!machine.hasWaiters())return;
+    {auto& trace=currentTrace();trace.func=g_cur_func;trace.esp=g_esp;}
     State saved;saved.save();machineLease->unlock();
-    if(milliseconds)std::this_thread::sleep_for(std::chrono::milliseconds(milliseconds));else std::this_thread::yield();
+    if(deadline!=std::chrono::steady_clock::time_point{})std::this_thread::sleep_until(deadline);
+    else if(milliseconds)std::this_thread::sleep_for(std::chrono::milliseconds(milliseconds));else std::this_thread::yield();
     machineLease->lock();saved.load();
 }
 // Blocking waits for guest synchronization objects. Guest threads only touch events, mutexes and
@@ -265,7 +326,7 @@ void checkGuestProgress() {
         auto now=std::chrono::steady_clock::now();
         if(now>bootDeadline)throw GuestStop("CRT bring-up time budget reached at "+hex(g_cur_func));
         // Time slicing only matters while threads take turns; parallel guest code holds no machine.
-        if(now>=nextYield&&(!parallelGuest||machine.heldByMe())){yieldGuestMachine();nextYield=std::chrono::steady_clock::now()+std::chrono::microseconds(500);}
+        if(now>=nextYield&&(!parallelGuest||machine.heldByMe())){if(machine.hasWaiters())yieldGuestMachine();nextYield=std::chrono::steady_clock::now()+std::chrono::microseconds(500);}
     }
     if(!guestThreadFault.empty())throw GuestStop(guestThreadFault);
 }
@@ -328,14 +389,23 @@ void getVersion() {
     if (bytes==156) { auto* p=static_cast<unsigned char*>(ptr(out+148,8)); p[6]=1; }
     ret(1,1);
 }
+// guest_modules.inc (game DLLs run as lifted code) needs callGuest, so it comes later.
+uint32_t loadGuestModule(const std::string& name);
+bool freeGuestModule(uint32_t handle);
+uint32_t guestModuleHandle(const std::string& name);
+bool guestModuleExport(uint32_t handle,const std::string& name,uint32_t& va);
+bool isGuestModule(uint32_t handle);
 void moduleHandle() {
     if(!arg(0)) { ret(imageBase,1); return; }
     auto name=lower(guestString(arg(0)));
     auto separator=name.find_last_of("/\\"); if(separator!=std::string::npos) name=name.substr(separator+1);
     if(name=="speed2.exe") { ret(imageBase,1); return; }
     if(name.find('.')==std::string::npos) name+=".dll";
+    if(uint32_t loaded=guestModuleHandle(name)) { ret(loaded,1); return; }
     auto module=modules.find(name);
-    NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSU2","Module lookup %s",name.c_str());
+    static std::set<std::string> loggedLookups;
+    if(loggedLookups.insert(name).second)
+        NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSU2","Module lookup %s",name.c_str());
     if(module==modules.end()) lastError=126;
     ret(module==modules.end()?0:module->second,1);
 }
@@ -354,6 +424,7 @@ thread_local uint32_t qpcStreak=0;  // consecutive QueryPerformanceCounter reads
 thread_local uint32_t d3dToken{};
 void direct3DCreate(){ret(createGuestD3D9(arg(0)),1);}
 void freeD3DGuest(uint32_t address){heaps->free(GuestHeaps::process,address);}
+void serviceGuestSound();
 // D3D9 methods read at most args[0..9]: copy 12.
 extern "C" int nfs_fx_cap_depth;
 extern "C" void nfs_fx_capture(uint32_t token,const uint32_t* args,uint32_t count,int deferred);
@@ -384,9 +455,11 @@ void d3dDispatch(){uint32_t args[32];std::memcpy(args,ptr(g_esp+4,48),48);uint32
     }catch(...){
         NFS_RUNTIME_LOG(ANDROID_LOG_ERROR,"NFSU2","D3D9 guest caller=%08x stack=%08x token=%08x self=%08x",g_cur_func,g_esp,token,args[0]);throw;}
     if(timed){auto spent=std::chrono::steady_clock::now()-bridgeStart;bridgeTime+=token==0x7e002110u?spent:spent*64;presentTime+=token==0x7e002110u?spent:std::chrono::nanoseconds{};}
-    if(token==0x7e002110u)nfs_widescreen_apply_frame_rate();
-    // Diagnostics: NFSU2_IMPORT_STATS=1 logs the most-called imports (per frame) every 600 frames.
     if(token==0x7e002110u){
+        nfs_widescreen_apply_frame_rate();
+        lastPresentMs=steadyMs();
+        startStallWatch();
+        // Diagnostics: NFSU2_IMPORT_STATS=1 logs the most-called imports (per frame) every 600 frames.
         static const bool importStats=std::getenv("NFSU2_IMPORT_STATS")!=nullptr;
         static unsigned statFrames=0;static std::vector<uint64_t> lastCalls;
         if(importStats&&++statFrames%600==0){
@@ -403,18 +476,24 @@ void d3dDispatch(){uint32_t args[32];std::memcpy(args,ptr(g_esp+4,48),48);uint32
         }
     }
     if(token==0x7e002110u&&result==0){
-        static unsigned appliedLimit=0;static auto nextFrame=std::chrono::steady_clock::now();
-        unsigned cap=frameLimit.load(std::memory_order_relaxed);
+        static FramePacer pacer;
         auto now=std::chrono::steady_clock::now();
+#if defined(NFS_R36S)
         if(cap!=appliedLimit){appliedLimit=cap;nextFrame=now;}
         // Next deadline one period after the previous one, but never in the past: a frame that ran late
         // starts the next period now. (It used to reset only after falling 200 ms behind and then sleep a
         // whole period: at 5 fps that slept 33 ms every other frame.)
         if(cap){nextFrame=std::max(nextFrame+std::chrono::nanoseconds(1000000000ull/cap),now);
             if(nextFrame>now){std::this_thread::sleep_until(nextFrame);if(nfsIsGameThread())nfsWaitAdd(9,std::chrono::duration_cast<std::chrono::nanoseconds>(nextFrame-now).count());}}
+#else
+        auto deadline=pacer.deadline(now,frameLimit.load(std::memory_order_relaxed));
+        // The renderer has returned; guest audio/streaming workers can use the
+        // machine while this thread waits. Late frames incur no extra delay.
+        if(deadline>now)yieldGuestMachine(0,deadline);
+#endif
         static unsigned frames=0;static uint64_t totalFrames=0;static auto since=std::chrono::steady_clock::now();
         ++totalFrames;
-        if(++frames==120){auto now=std::chrono::steady_clock::now();double seconds=std::chrono::duration<double>(now-since).count();
+        if(++frames==120){serviceGuestSound();auto now=std::chrono::steady_clock::now();double seconds=std::chrono::duration<double>(now-since).count();
             uint32_t stackUsed=(stackHigh>stackMinEsp)?stackHigh-stackMinEsp:0;
             uint32_t stackSize=(stackHigh>stackLow)?stackHigh-stackLow:0;
             NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSU2","Guest D3D9 frame=%llu %.1f FPS over %.2f seconds; bridge ~%.2f ms/frame (present %.2f), %.0f calls/frame; guest stack %u/%u KiB",
@@ -422,12 +501,14 @@ void d3dDispatch(){uint32_t args[32];std::memcpy(args,ptr(g_esp+4,48),48);uint32
             frames=0;since=now;bridgeTime=presentTime=std::chrono::nanoseconds{};bridgeCalls=0;}
     }ret(result,count);}
 #endif
-uint32_t callGuest(uint32_t va,const std::vector<uint32_t>& args,uint32_t cleanup=0);
+// threadStart: a thread procedure may be stdcall or cdecl; Windows exits the thread right after either.
+uint32_t callGuest(uint32_t va,const std::vector<uint32_t>& args,uint32_t cleanup=0,bool threadStart=false);
 #include "guest_threads.inc"
 #include "guest_files.inc"
 #include "guest_kernel.inc"
 #include "guest_input.inc"
 #include "guest_audio.inc"
+#include "guest_network.inc"
 void testGuestScheduling(){
     State original;original.save();uint32_t savedError=lastError,savedTLS=tlsValues[1087];
     g_eax=0x11223344;g_fs_base=0x21000000;g_st[0]=123.5;g_xmm[7].u64[0]=0x123456789abcdef0ull;
@@ -441,15 +522,26 @@ void testGuestScheduling(){
             if(g_eax!=0xaabbccdd||g_fs_base!=0xdead1000||g_st[0]!=-456.25||g_xmm[7].u64[0]!=0xfedcba9876543210ull||lastError!=222||tlsValues[1087]!=0xaa)
                 throw GuestStop("Guest worker context was not isolated");}}
         catch(const std::exception& error){failure=error.what();}
-        done=true;machineLease=nullptr;
+        forgetThreadTrace();done=true;machineLease=nullptr;
     });
-    try{while(!done){checkGuestProgress();yieldGuestMachine();
+    try{while(!done){checkGuestProgress();yieldGuestMachine(0,std::chrono::steady_clock::now()+std::chrono::milliseconds(1));
         if(g_eax!=0x11223344||g_fs_base!=0x21000000||g_st[0]!=123.5||g_xmm[7].u64[0]!=0x123456789abcdef0ull||lastError!=111||tlsValues[1087]!=0x55)
             failure="Main guest context was not preserved during handover";
     }}catch(const std::exception& error){failure=error.what();}
     machineLease->unlock();worker.join();machineLease->lock();original.load();lastError=savedError;tlsValues[1087]=savedTLS;
     if(!failure.empty())throw GuestStop(failure);
     NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSU2","Guest scheduler passed 100 handovers with separate integer, FS, x87, XMM, TLS and last-error state");
+}
+void testGuestSoundCaps(){
+    State saved;saved.save();
+    uint32_t output=allocate(96),device=createSoundObject(1);
+    write32(output,96);
+    uint32_t result=callGuest(soundMethodBase+0x1000+4*16,{device,output});
+    bool ok=result==0&&read32(output)==96&&read32(output+4)==0xf1f&&read32(output+8)==100&&
+        read32(output+12)==200000&&read32(output+16)==1&&read32(output+20)==0;
+    callGuest(soundMethodBase+0x1000+2*16,{device});heaps->free(GuestHeaps::process,output);saved.load();
+    if(!ok)throw GuestStop("DirectSound PCM capabilities regression");
+    NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSMW","DirectSound caps passed: mono/stereo, 8/16-bit, continuous rates, software buffers and guest ABI");
 }
 recomp_func_t resolveFunction(const std::string& dll, const std::string& name) {
     if((dll=="shfolder.dll"||dll=="shell32.dll")&&name=="SHGetFolderPathA")return shellFolderPath;
@@ -464,6 +556,10 @@ recomp_func_t resolveFunction(const std::string& dll, const std::string& name) {
     if(dll=="advapi32.dll"&&name=="RegCloseKey")return regCloseKey;
     if(dll=="advapi32.dll"&&name=="RegQueryValueExA")return regQueryValueExA;
     if(dll=="advapi32.dll"&&name=="RegSetValueExA")return regSetValueExA;
+    if(dll=="ws2_32.dll"||dll=="wsock32.dll"){auto found=networkFunctions.find(name);if(found!=networkFunctions.end())return found->second;}
+    if(dll=="netapi32.dll"&&name=="Netbios")return netbios;
+    if(dll=="tapi32.dll"&&name=="lineInitialize")return lineInitialize;
+    if(dll=="tapi32.dll"&&name=="lineShutdown")return lineShutdown;
     if(dll=="user32.dll") {auto found=windowFunctions.find(name);if(found!=windowFunctions.end())return found->second;}
     if(dll=="winmm.dll") {auto found=timerFunctions.find(name);if(found!=timerFunctions.end())return found->second;}
     if (dll == "kernel32.dll") {
@@ -485,8 +581,9 @@ recomp_func_t resolveFunction(const std::string& dll, const std::string& name) {
 void getProcAddress() {
     uint32_t module=arg(0),namePointer=arg(1);
     auto found=std::find_if(modules.begin(),modules.end(),[&](auto& m){return m.second==module;});
-    if(found==modules.end()) { lastError=126; ret(0,2); return; }
     auto name=namePointer<=0xffff?"#"+std::to_string(namePointer):guestString(namePointer);
+    if(uint32_t va;found==modules.end()&&guestModuleExport(module,name,va)) { ret(va,2); return; }
+    if(found==modules.end()) { lastError=isGuestModule(module)?127:126; ret(0,2); return; }
     auto full=found->first+"!"+name;
     for(uint32_t i=0;i<imports.size();++i) if(imports[i].name==full) { ret(importBase+i*16,2); return; }
     // Only advertise exports that are actually implemented, not permissive stubs.
@@ -500,15 +597,44 @@ template<class T> T fileStruct(const std::vector<unsigned char>& file, uint64_t 
     if (offset > file.size() || sizeof(T) > file.size()-offset) throw GuestStop("Truncated PE structure");
     T value{}; std::memcpy(&value,file.data()+offset,sizeof value); return value;
 }
-void imageRange(uint32_t rva, uint64_t bytes) {
-    if (rva > imageSize || bytes > uint64_t(imageSize)-rva) throw GuestStop("PE image range invalid");
+void moduleRange(uint32_t size, uint32_t rva, uint64_t bytes) {
+    if (rva > size || bytes > uint64_t(size)-rva) throw GuestStop("PE image range invalid");
 }
-std::string imageString(uint32_t rva) {
-    imageRange(rva,1); std::string value;
-    for (uint32_t i=rva; i<imageSize && value.size()<512; ++i) {
-        char c = *static_cast<char*>(ptr(imageBase+i,1)); if (!c) return value; value.push_back(c);
+std::string moduleString(uint32_t base, uint32_t size, uint32_t rva) {
+    moduleRange(size,rva,1); std::string value;
+    for (uint32_t i=rva; i<size && value.size()<512; ++i) {
+        char c = *static_cast<char*>(ptr(base+i,1)); if (!c) return value; value.push_back(c);
     }
     throw GuestStop("Unterminated PE import name");
+}
+void imageRange(uint32_t rva, uint64_t bytes) { moduleRange(imageSize,rva,bytes); }
+// Writes an import token into every IAT slot of a mapped image (SPEED2.EXE or a game DLL).
+void bindImports(uint32_t base, uint32_t size, uint32_t directoryRva, uint32_t directorySize) {
+    moduleRange(size,directoryRva,directorySize);
+    bool terminated=false;
+    for (uint32_t offset=0; uint64_t(offset)+sizeof(pe_import_descriptor)<=directorySize; offset+=sizeof(pe_import_descriptor)) {
+        pe_import_descriptor descriptor{};
+        std::memcpy(&descriptor,ptr(base+directoryRva+offset,sizeof descriptor),sizeof descriptor);
+        if (!descriptor.Name && !descriptor.FirstThunk) { terminated=true; break; }
+        auto dll=moduleString(base,size,descriptor.Name);
+        std::transform(dll.begin(),dll.end(),dll.begin(),[](unsigned char c){return char(std::tolower(c));});
+        if(!modules.count(dll)) modules[dll]=0x71000000u+uint32_t(modules.size())*0x10000u;
+        uint32_t names=descriptor.OriginalFirstThunk ? descriptor.OriginalFirstThunk : descriptor.FirstThunk;
+        for (uint32_t i=0;;++i) {
+            uint64_t nameRva=uint64_t(names)+i*4ull, iatRva=uint64_t(descriptor.FirstThunk)+i*4ull;
+            if (nameRva>UINT32_MAX || iatRva>UINT32_MAX) throw GuestStop("PE thunk overflow");
+            moduleRange(size,uint32_t(nameRva),4); moduleRange(size,uint32_t(iatRva),4);
+            uint32_t thunk=read32(base+uint32_t(nameRva)); if (!thunk) break;
+            std::string name;
+            if (thunk&PE_ORDINAL_FLAG) name="#"+std::to_string(thunk&0xffff);
+            else { moduleRange(size,thunk,3); name=moduleString(base,size,thunk+2); }
+            if (imports.size()>=4096) throw GuestStop("Too many PE imports");
+            uint32_t va=importBase+uint32_t(imports.size())*16;
+            imports.push_back({dll+"!"+name,resolveFunction(dll,name)});
+            write32(base+uint32_t(iatRva),va);
+        }
+    }
+    if (!terminated) throw GuestStop("Unterminated PE import descriptors");
 }
 void loadImage(const char* path) {
     std::ifstream stream(path,std::ios::binary);
@@ -538,35 +664,12 @@ void loadImage(const char* path) {
     entry=imageBase+opt.AddressOfEntryPoint;
     // Guest VAs stay fixed; the 64-bit host base is ADDR's offset. No PE
     // relocation toward the host address and no executable x86 mapping.
-    auto directory=opt.DataDirectory[PE_DIR_IMPORT]; imageRange(directory.VirtualAddress,directory.Size);
-    bool terminated=false;
-    for (uint32_t offset=0; uint64_t(offset)+sizeof(pe_import_descriptor)<=directory.Size; offset+=sizeof(pe_import_descriptor)) {
-        pe_import_descriptor descriptor{};
-        std::memcpy(&descriptor,ptr(imageBase+directory.VirtualAddress+offset,sizeof descriptor),sizeof descriptor);
-        if (!descriptor.Name && !descriptor.FirstThunk) { terminated=true; break; }
-        auto dll=imageString(descriptor.Name);
-        std::transform(dll.begin(),dll.end(),dll.begin(),[](unsigned char c){return char(std::tolower(c));});
-        if(!modules.count(dll)) modules[dll]=0x71000000u+uint32_t(modules.size())*0x10000u;
-        uint32_t names=descriptor.OriginalFirstThunk ? descriptor.OriginalFirstThunk : descriptor.FirstThunk;
-        for (uint32_t i=0;;++i) {
-            uint64_t nameRva=uint64_t(names)+i*4ull, iatRva=uint64_t(descriptor.FirstThunk)+i*4ull;
-            if (nameRva>UINT32_MAX || iatRva>UINT32_MAX) throw GuestStop("PE thunk overflow");
-            imageRange(uint32_t(nameRva),4); imageRange(uint32_t(iatRva),4);
-            uint32_t thunk=read32(imageBase+uint32_t(nameRva)); if (!thunk) break;
-            std::string name;
-            if (thunk&PE_ORDINAL_FLAG) name="#"+std::to_string(thunk&0xffff);
-            else { imageRange(thunk,3); name=imageString(thunk+2); }
-            if (imports.size()>=4096) throw GuestStop("Too many PE imports");
-            uint32_t va=importBase+uint32_t(imports.size())*16;
-            imports.push_back({dll+"!"+name,resolveFunction(dll,name)});
-            write32(imageBase+uint32_t(iatRva),va);
-        }
-    }
-    if (!terminated) throw GuestStop("Unterminated PE import descriptors");
+    auto directory=opt.DataDirectory[PE_DIR_IMPORT];
+    bindImports(imageBase,imageSize,directory.VirtualAddress,directory.Size);
     NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSU2","Guest PE mapped: base=%08x size=%08x entry=%08x; %zu imports bound; %u lifted functions",
         imageBase,imageSize,entry,imports.size(),recomp_dispatch_count);
 }
-uint32_t callGuest(uint32_t va, const std::vector<uint32_t>& args, uint32_t cleanup) {
+uint32_t callGuest(uint32_t va, const std::vector<uint32_t>& args, uint32_t cleanup, bool threadStart) {
     State saved; saved.save();
     // Parallel guest threads: guest code runs without the machine; the runtime re-takes it on the
     // way back in (import/override trampolines). Restored to the same depth on return.
@@ -578,10 +681,11 @@ uint32_t callGuest(uint32_t va, const std::vector<uint32_t>& args, uint32_t clea
         for (auto it=args.rbegin();it!=args.rend();++it) { g_esp-=4; write32(g_esp,*it); }
         g_esp-=4; write32(g_esp,RECOMP_RETADDR);
         fn(); g_esp+=cleanup;
-        if (g_esp!=saved.esp) throw GuestStop("Guest call stack imbalance at " + hex(va));
+        if (g_esp!=saved.esp&&!(threadStart&&g_esp+4u*uint32_t(args.size())==saved.esp)) throw GuestStop("Guest call stack imbalance at " + hex(va));
         uint32_t result=g_eax; machine.reacquire(held); saved.load(); return result;
     } catch (...) { machine.reacquire(held); saved.load(); throw; }
 }
+#include "guest_modules.inc"
 void testLiftedCopy() {
     uint32_t source=allocate(128), dest=allocate(128);
     for (unsigned i=0;i<128;++i) static_cast<unsigned char*>(ptr(source,128))[i]=static_cast<unsigned char>(i^0xa5);
@@ -769,6 +873,10 @@ void testGeneratedCallbacks(){
 // detection of the import.
 extern "C" uint64_t nfsQpcNow(){return qpcRead();}
 
+#ifdef NFS_SERVER_DLL
+extern "C" const recomp_dispatch_entry_t server_recomp_dispatch_table[];
+extern "C" const uint32_t server_recomp_dispatch_count;
+#endif
 namespace {
 // Every indirect call and virtual method resolves its target here, so use an
 // open-addressing table (built once, read-only afterwards) instead of a binary
@@ -778,13 +886,22 @@ struct DispatchHash {
     std::unique_ptr<uint32_t[]> keys{new uint32_t[slots]()};
     std::unique_ptr<recomp_func_t[]> funcs{new recomp_func_t[slots]()};
     static uint32_t slot(uint32_t va){return (va*0x9e3779b1u)>>16;}
-    DispatchHash(){
-        static_assert(slots>2*27742,"dispatch hash load factor");
-        for(uint32_t i=0;i<recomp_dispatch_count;++i){
-            uint32_t va=recomp_dispatch_table[i].address,s=slot(va);
+    void add(const recomp_dispatch_entry_t* table,uint32_t count){
+        for(uint32_t i=0;i<count;++i){
+            uint32_t va=table[i].address,s=slot(va);
+            if(va-0x7c000000u<0x04000000u)throw GuestStop("Lifted function overlaps reserved native dispatch stubs");
             while(keys[s])s=(s+1)&(slots-1);
-            keys[s]=va;funcs[s]=recomp_dispatch_table[i].func;
+            keys[s]=va;funcs[s]=table[i].func;
         }
+    }
+    DispatchHash(){
+        static_assert(slots>2*(27742+1531),"dispatch hash load factor");
+        add(recomp_dispatch_table,recomp_dispatch_count);
+#ifdef NFS_SERVER_DLL
+        add(server_recomp_dispatch_table,server_recomp_dispatch_count);
+#endif
+        uint32_t used=0;for(uint32_t i=0;i<slots;++i)used+=keys[i]!=0;
+        if(used>slots/2)throw GuestStop("Dispatch hash over half full: "+std::to_string(used));
     }
     recomp_func_t find(uint32_t va)const{
         if(!va)return nullptr;
@@ -794,13 +911,12 @@ struct DispatchHash {
 };
 }
 extern "C" recomp_func_t recomp_lookup(uint32_t va) {
-    if(recomp_dispatch_count<DispatchHash::slots/2){static const DispatchHash hash;return hash.find(va);}
-    uint32_t lo=0,hi=recomp_dispatch_count;
-    while (lo<hi) { uint32_t mid=lo+(hi-lo)/2, address=recomp_dispatch_table[mid].address;
-        if (address==va) return recomp_dispatch_table[mid].func;
-        if (address<va) lo=mid+1; else hi=mid;
-    }
-    return nullptr;
+    // Sound/input/D3D COM and import stubs resolve in recomp_lookup_import.
+    // Avoid an always-failing hash probe on every native method call. The
+    // table constructor checks that no lifted module occupies this range.
+    if(va-0x7c000000u<0x04000000u)return nullptr;
+    static const DispatchHash hash;
+    return hash.find(va);
 }
 // Parallel guest threads: runtime functions reached from lifted code run under the machine. The lookup
 // takes it and returns this trampoline, which runs the function and releases it (the lookup's side
@@ -1020,6 +1136,7 @@ std::string connectGuestRuntime(const char* executable) {
         testLiftedCopy();
         testGuestScheduling();
         testGuestInput();
+        testGuestSoundCaps();
         testGuestTimers();
         testGuestFileTime();
         testGuestCriticalSections();
@@ -1119,6 +1236,13 @@ void setGuestFrameLimit(unsigned framesPerSecond){
 }
 void setGuestKey(unsigned scan,bool down){if(scan>=256)return;std::lock_guard<std::mutex> lock(inputMutex);if(bool(inputKeys[scan])==down)return;inputKeys[scan]=down?0x80:0;recordInputKey(scan,down);enqueueGuestKey(scan,down);}
 void clearGuestInput(){std::lock_guard<std::mutex> lock(inputMutex);for(unsigned scan=0;scan<256;++scan)if(inputKeys[scan]){recordInputKey(scan,false);enqueueGuestKey(scan,false);}inputKeys.fill(0);inputMouseButtons.fill(0);inputMouseX=inputMouseY=inputMouseZ=0;}
+void setGuestPointer(float x,float y,int phase){
+    guestPointerX=std::clamp(x,0.f,1.f);guestPointerY=std::clamp(y,0.f,1.f);
+    if(phase!=1){std::lock_guard<std::mutex> lock(inputMutex);inputMouseButtons[0]=phase==0?0x80:0;}
+    enqueueGuestPointer(phase);
+}
+void typeGuestText(const std::vector<uint32_t>& characters){enqueueGuestText(characters);}
+void setGuestOnlineServer(const std::string& host){std::lock_guard<MachineMutex> lock(machine);if(!memory&&!host.empty())onlineServer=host;}
 void setGuestWidescreen(bool enabled){std::lock_guard<MachineMutex> lock(machine);if(!memory)guestWidescreen=enabled;}
 void setGuestLanguage(const char* language){
     std::lock_guard<MachineMutex> lock(machine);if(memory)return;

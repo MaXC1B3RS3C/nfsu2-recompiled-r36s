@@ -9,6 +9,7 @@
  * slot, arguments are at g_esp+4.., the body leaves its result in g_eax and
  * pops what `ret N` would (g_esp += 4 + N).
  */
+#include <string.h>
 #include "recomp_types.h"
 #include "nfs_runtime.h"
 
@@ -147,9 +148,23 @@ static void ov_fx_method(void) {
     }
     if (cFn[h]) cFn[h]();
 }
+/* 0x0075CFD0: the static CRT memcpy/memmove(dst, src, n) (cdecl, returns dst).
+ * It handles overlap by copying backward, and reaches its unrolled dword moves
+ * through computed jumps into the middle of straight-line blocks (tables at
+ * 0x75D11C, 0x75D268, 0x75D2B8...). Not every target is a lifted entry, so an
+ * overlapping move with 8+ dwords stopped at "ITAIL unresolved 0x0075D27C".
+ * Its contract is exactly the host memmove over guest memory. */
+static void ov_crt_memmove(void) {
+    uint32_t dst = MEM32(g_esp + 4), src = MEM32(g_esp + 8), n = MEM32(g_esp + 12);
+    if (n) memmove((void *)ADDR(dst), (const void *)ADDR(src), n);
+    g_eax = dst;
+    g_esp += 4;
+}
+
 static const struct { uint32_t va; nfs_override_fn fn; } k_overrides[] = {
     { 0x006F5FC5u, ov_is_cyrix },
     { 0x0066A9F6u, ov_fx_begin_pass },
+    { 0x0075CFD0u, ov_crt_memmove },
 };
 
 /* Called on every indirect call that misses its call-site cache (polymorphic vtable sites), and for every

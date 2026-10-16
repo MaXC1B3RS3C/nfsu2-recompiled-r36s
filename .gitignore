@@ -39,4 +39,12 @@ third_party/SPIRV-Cross/
 dist/
 *.aarch64
 
+# Third-party online mod binaries (local reference only)
+onlinemod/
+
+# Lifted server.dll (derived from the game binary)
+src/recomp/gen_server/
+
+# Tester diagnostic reports
+NFSU2-diagnostico-*.zip
 

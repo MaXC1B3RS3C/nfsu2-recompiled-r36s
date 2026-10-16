@@ -8,6 +8,17 @@ set(DXVK_SOURCE "" CACHE PATH "Source prepared by prepare.py")
 if(NOT EXISTS "${DXVK_SOURCE}/PINNED_REVISION")
   message(FATAL_ERROR "Run prepare.py with the pinned DXVK native revision")
 endif()
+set(DXVK_PREPARE_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/prepare.py" CACHE FILEPATH "DXVK Android preparation recipe")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${DXVK_PREPARE_SCRIPT}" "${DXVK_SOURCE}/ANDROID_PREPARE_SHA256")
+file(SHA256 "${DXVK_PREPARE_SCRIPT}" DXVK_EXPECTED_PREPARE_SHA256)
+if(NOT EXISTS "${DXVK_SOURCE}/ANDROID_PREPARE_SHA256")
+  message(FATAL_ERROR "DXVK patches not verified: rerun ${DXVK_PREPARE_SCRIPT}")
+endif()
+file(READ "${DXVK_SOURCE}/ANDROID_PREPARE_SHA256" DXVK_ACTUAL_PREPARE_SHA256)
+string(STRIP "${DXVK_ACTUAL_PREPARE_SHA256}" DXVK_ACTUAL_PREPARE_SHA256)
+if(NOT DXVK_ACTUAL_PREPARE_SHA256 STREQUAL DXVK_EXPECTED_PREPARE_SHA256)
+  message(FATAL_ERROR "DXVK patches are stale: rerun ${DXVK_PREPARE_SCRIPT}")
+endif()
 file(GLOB UTIL "${DXVK_SOURCE}/src/util/*.cpp" "${DXVK_SOURCE}/src/util/com/*.cpp"
   "${DXVK_SOURCE}/src/util/config/*.cpp" "${DXVK_SOURCE}/src/util/log/*.cpp"
   "${DXVK_SOURCE}/src/util/sha1/*.c" "${DXVK_SOURCE}/src/util/sha1/*.cpp"

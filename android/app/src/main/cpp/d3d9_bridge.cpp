@@ -1,6 +1,7 @@
 #include "d3d9_bridge.h"
 #include "runtime_log.h"
 #include "dxt_shadow.h"
+#include "vertex_formats.h"
 #include <d3d9.h>
 #include <algorithm>
 #include <map>
@@ -138,8 +139,9 @@ void setD3D9Compatibility(bool cpuTextures,unsigned backBuffers){
 void configureD3D9Bridge(void* base,uint32_t (*allocator)(uint32_t),void (*deallocator)(uint32_t)){
     guestBase=base;allocateGuest=allocator;freeGuest=deallocator;
 #ifdef __ANDROID__
-    // Shader caches are optional; the Android process has no writable cwd.
-    setenv("DXVK_STATE_CACHE","0",1);
+    // android_main provides a writable private cache before creating DXVK.
+    // Other bring-up callers can still run without a writable working directory.
+    if(!std::getenv("DXVK_STATE_CACHE_PATH"))setenv("DXVK_STATE_CACHE","0",1);
     setenv("DXVK_LOG_PATH","none",1);
 #endif
 #if !defined(__ANDROID__) && !defined(NFS_R36S) && !defined(NFS_GLES)
@@ -186,6 +188,23 @@ uint32_t createGuestD3D9(uint32_t sdk){
     NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSU2","DXVK native Direct3DCreate9 sdk=%u",sdk);
     return wrap(native,Kind::D3D9);
 }
+// Logs each vertex declaration type the first time the game uses it, flagging the
+// ones this GPU cannot fetch (see vertex_formats.h): the evidence for stretched geometry.
+void noteVertexDeclaration(const D3DVERTEXELEMENT9* elements){
+    static bool seen[32]{};
+    for(unsigned i=0;elements&&i<64&&elements[i].Stream!=0xff;++i){
+        unsigned type=elements[i].Type;
+        if(type>=32||seen[type])continue;
+        seen[type]=true;
+        const char* name="?";for(auto& entry:kD3DVertexFormats)if(entry.type==type)name=entry.name;
+        NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSU2","D3D9 game vertex type %s (usage %u)",name,unsigned(elements[i].Usage));
+    }
+}
+// Set when DXVK could not rebuild the swap chain in Reset. DXVK's TestCooperativeLevel
+// always reports D3D_OK, so the game would keep drawing on the half-reset device and
+// crash (null dereference, Mali reports); until a Reset succeeds the device reads as
+// lost and needing a reset, which the game handles as on Windows.
+bool deviceResetPending=false;
 extern "C" uint32_t getD3D9PresentCount();
 static uint32_t dispatchGuestD3D9Inner(uint32_t token,const uint32_t* args,uint32_t* argumentCount){
     uint32_t kind=(token-methodBase)/4096,method=((token-methodBase)%4096)/16;
@@ -212,7 +231,7 @@ static uint32_t dispatchGuestD3D9Inner(uint32_t token,const uint32_t* args,uint3
     // DXVK recreates its presenter while keeping the game's device/resources.
     if((kind==2&&method==17)||(kind==13&&method==3)){
         *argumentCount=kind==2?5:6;auto window=dxvkAndroidGetWindowHandle();
-        if(!window)return D3DERR_DEVICELOST;
+        if(!window||deviceResetPending)return D3DERR_DEVICELOST;
         auto source=static_cast<const RECT*>(pointer(args[1])),destination=static_cast<const RECT*>(pointer(args[2]));
         auto dirty=static_cast<const RGNDATA*>(pointer(args[4]));
         return kind==2?static_cast<IDirect3DDevice9*>(object)->Present(source,destination,window,dirty):
@@ -277,14 +296,30 @@ static uint32_t dispatchGuestD3D9Inner(uint32_t token,const uint32_t* args,uint3
             parameters.Windowed=p[8];parameters.EnableAutoDepthStencil=p[9];parameters.AutoDepthStencilFormat=static_cast<D3DFORMAT>(p[10]);parameters.Flags=p[11];parameters.FullScreen_RefreshRateInHz=p[12];parameters.PresentationInterval=D3DPRESENT_INTERVAL_IMMEDIATE;
             IDirect3DDevice9* device=nullptr;HRESULT status=d3d->CreateDevice(args[1],static_cast<D3DDEVTYPE>(args[2]),window,args[4],&parameters,&device);
             NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSU2","D3D9 backbuffer %ux%u CreateDevice result=%08x",parameters.BackBufferWidth,parameters.BackBufferHeight,uint32_t(status));
-            write(args[6],SUCCEEDED(status)?wrap(device,Kind::Device):0);return status;
+            // Without a device the game carries on and faults later in its own
+            // code (PowerVR GE8322 reports): after its retry also fails, stop
+            // here with the reason instead.
+            static unsigned failures=0;failures=FAILED(status)?failures+1:0;
+            if(FAILED(status)&&failures<2)return status;
+            if(FAILED(status))throw std::runtime_error("La GPU no pudo crear el dispositivo grafico (Vulkan, CreateDevice "+
+                std::to_string(uint32_t(status))+"). Usa \"Probar driver\" en el launcher para ver que le falta.");
+            write(args[6],wrap(device,Kind::Device));return status;
         }
         }
     }
     if(kind==2){auto device=static_cast<IDirect3DDevice9*>(object);switch(method){
         case 9:{*argumentCount=2;D3DDEVICE_CREATION_PARAMETERS p{};HRESULT status=device->GetCreationParameters(&p);if(SUCCEEDED(status)){write(args[1],p.AdapterOrdinal);write(args[1]+4,p.DeviceType);write(args[1]+8,0xf0000301);write(args[1]+12,p.BehaviorFlags);}return status;}
         case 13:{*argumentCount=3;auto p=presentation(args[1]);IDirect3DSwapChain9* result=nullptr;HRESULT status=device->CreateAdditionalSwapChain(&p,&result);write(args[2],SUCCEEDED(status)?wrap(result,Kind::SwapChain):0);return status;}
-        case 16:{*argumentCount=2;auto p=presentation(args[1]);auto status=device->Reset(&p);
+        case 16:{*argumentCount=2;auto p=presentation(args[1]);HRESULT status=D3DERR_DEVICELOST;
+            // DXVK throws (DxvkError) when it cannot rebuild the swap chain; Windows
+            // would report a lost device, which the game retries (Mali G615 report).
+            // The old Android window can stay busy for a moment: retry once before giving up.
+            for(int attempt=0;attempt<2;++attempt){
+                try{status=device->Reset(&p);break;}catch(...){
+                    NFS_RUNTIME_LOG(ANDROID_LOG_ERROR,"NFSU2","D3D9 Reset raised a DXVK error (attempt %d)",attempt+1);status=D3DERR_DEVICELOST;
+                    if(!attempt)std::this_thread::sleep_for(std::chrono::milliseconds(100));}
+            }
+            deviceResetPending=status==D3DERR_DEVICELOST;
             NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSU2","D3D9 Reset backbuffer %ux%u result=%08x",p.BackBufferWidth,p.BackBufferHeight,uint32_t(status));return status;}
         case 23:{*argumentCount=9;if(args[8])throw std::runtime_error("Shared texture handle pending");if(!args[7])return D3DERR_INVALIDCALL;
             auto original=static_cast<D3DFORMAT>(args[5]),format=nativeTextureFormat(device,original,args[4],D3DRTYPE_TEXTURE);IDirect3DTexture9* texture=nullptr;

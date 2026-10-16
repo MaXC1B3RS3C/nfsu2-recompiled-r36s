@@ -8,6 +8,10 @@
 #include <cstring>
 #include <thread>
 #include <chrono>
+#include <filesystem>
+#include <cstdlib>
+#include <unistd.h>
+#include "vertex_formats.h"
 #include "guest_memory.h"
 #include "game_data.h"
 #include "guest_runtime.h"
@@ -107,6 +111,9 @@ struct Renderer {
             if (gpu) {
                 __android_log_print(ANDROID_LOG_INFO, "NFSU2", "GPU %s; API %u.%u; required Vulkan 1.1", props.deviceName,
                     VK_VERSION_MAJOR(props.apiVersion), VK_VERSION_MINOR(props.apiVersion));
+                auto vertexMissing = unsupportedD3DVertexFormats(candidate, vkGetPhysicalDeviceFormatProperties);
+                __android_log_print(vertexMissing.empty() ? ANDROID_LOG_INFO : ANDROID_LOG_WARN, "NFSU2",
+                    "D3D9 vertex types without Vulkan vertex fetch: %s", vertexMissing.empty() ? "none" : vertexMissing.c_str());
                 break;
             }
         }
@@ -275,29 +282,18 @@ extern "C" JNIEXPORT void JNICALL Java_com_nfsu2_androidevolved_GameActivity_nat
     __android_log_print(ANDROID_LOG_INFO,"NFSU2","Android touch DIK=%02x down=%d",unsigned(scan),int(down));
 }
 extern "C" JNIEXPORT jboolean JNICALL Java_com_nfsu2_androidevolved_GameActivity_nativeDrivingControls(JNIEnv*,jclass){return guestDrivingControls()?JNI_TRUE:JNI_FALSE;}
+extern "C" JNIEXPORT void JNICALL Java_com_nfsu2_androidevolved_GameActivity_nativePointer(JNIEnv*,jclass,jfloat x,jfloat y,jint phase){
+    setGuestPointer(x,y,phase);
+}
 extern "C" JNIEXPORT void JNICALL Java_com_nfsu2_androidevolved_GameActivity_nativeTypeText(JNIEnv* env,jclass,jstring value,jboolean replace){
     if(!value)return;
     const jchar* chars=env->GetStringChars(value,nullptr);if(!chars)return;
     jsize length=env->GetStringLength(value);
-    static constexpr unsigned letterScans[]={0x1e,0x30,0x2e,0x20,0x12,0x21,0x22,0x23,0x17,0x24,0x25,0x26,0x32,0x31,0x18,0x19,0x10,0x13,0x1f,0x14,0x16,0x2f,0x11,0x2d,0x15,0x2c};
-    std::vector<unsigned> sequence;if(replace==JNI_TRUE)sequence.insert(sequence.end(),8,0xe);
-    for(jsize i=0;i<length&&i<16;++i){
-        unsigned ch=chars[i],scan=0;
-        if(ch>='a'&&ch<='z')ch-='a'-'A';
-        if(ch>='A'&&ch<='Z')scan=letterScans[ch-'A'];
-        else if(ch>='0'&&ch<='9')scan=ch=='0'?0xb:ch-'0'+1;
-        else if(ch==' ')scan=0x39;
-        if(scan)sequence.push_back(scan);
-    }
+    std::vector<uint32_t> characters;if(replace==JNI_TRUE)characters.assign(40,8);
+    for(jsize i=0;i<length&&i<40;++i)if(chars[i]>=0x20&&chars[i]<0x7f)characters.push_back(chars[i]);
     env->ReleaseStringChars(value,chars);
-    std::thread([sequence=std::move(sequence),length]{
-        std::this_thread::sleep_for(std::chrono::milliseconds(180));
-        for(unsigned scan:sequence){
-            setGuestKey(scan,true);std::this_thread::sleep_for(std::chrono::milliseconds(70));
-            setGuestKey(scan,false);std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        }
-        __android_log_print(ANDROID_LOG_INFO,"NFSU2","Android text delivered to guest: %d characters",int(length));
-    }).detach();
+    typeGuestText(characters);
+    __android_log_print(ANDROID_LOG_INFO,"NFSU2","Android text delivered to guest: %d characters",int(length));
 }
 extern "C" JNIEXPORT void JNICALL Java_com_nfsu2_androidevolved_GameActivity_nativeLanguage(JNIEnv* env,jclass,jstring language){
     const char* value=env->GetStringUTFChars(language,nullptr);if(!value)return;
@@ -308,6 +304,9 @@ extern "C" JNIEXPORT void JNICALL Java_com_nfsu2_androidevolved_GameActivity_nat
 extern "C" JNIEXPORT void JNICALL Java_com_nfsu2_androidevolved_GameActivity_nativeGamepadConnected(JNIEnv*,jclass,jboolean connected){setGuestPadConnected(connected==JNI_TRUE);}
 extern "C" JNIEXPORT void JNICALL Java_com_nfsu2_androidevolved_GameActivity_nativeWidescreen(JNIEnv*,jclass,jboolean enabled){setGuestWidescreen(enabled==JNI_TRUE);}
 // Minimap at the top-left: the bottom-left corner sits under the steering thumb.
+extern "C" JNIEXPORT void JNICALL Java_com_nfsu2_androidevolved_GameActivity_nativeOnlineServer(JNIEnv* env,jclass,jstring host){
+    const char* text=env->GetStringUTFChars(host,nullptr);setGuestOnlineServer(text?text:"");env->ReleaseStringUTFChars(host,text);
+}
 extern "C" JNIEXPORT void JNICALL Java_com_nfsu2_androidevolved_GameActivity_nativeMinimapTop(JNIEnv*,jclass,jboolean top){nfs_widescreen_set_minimap_offset(top==JNI_TRUE?-230.0f:0.0f);}
 static bool compatCpuTextures=false;static unsigned compatBackBuffers=2;
 extern "C" JNIEXPORT void JNICALL Java_com_nfsu2_androidevolved_GameActivity_nativeBackBuffers(JNIEnv*,jclass,jint count){
@@ -332,7 +331,23 @@ extern "C" JNIEXPORT void JNICALL Java_com_nfsu2_androidevolved_GameActivity_nat
     if(!entry){customVulkanError="No se pudo cargar el driver Vulkan "+l+". Elige el driver del sistema en el launcher.";return;}
     dxvkAndroidSetInstanceProcAddr(entry);
 }
+static void configurePipelineCache(android_app* app){
+    const char* files=app->activity->internalDataPath;
+    setenv("DXVK_STATE_CACHE","0",1); // Keep startup usable if cache storage is unavailable.
+    if(!files||!*files)return;
+    // Renderer cache epoch 2: avoid stale caches from the old DXVK preparation.
+    // Keep the directory name in sync with GraphicsCache.java.
+    auto directory=std::filesystem::path(files).parent_path()/"cache"/"dxvk-v2";
+    std::error_code error;std::filesystem::create_directories(directory,error);
+    if(error||access(directory.c_str(),W_OK)!=0){
+        __android_log_print(ANDROID_LOG_WARN,"NFSU2","DXVK pipeline state cache unavailable; continuing without it");return;
+    }
+    setenv("DXVK_STATE_CACHE_PATH",directory.c_str(),1);
+    setenv("DXVK_STATE_CACHE","1",1);
+    __android_log_print(ANDROID_LOG_INFO,"NFSU2","DXVK persistent pipeline state cache: %s",directory.c_str());
+}
 void android_main(android_app* app) {
+    configurePipelineCache(app);
     Host host; app->userData = &host; app->onAppCmd = onCommand;app->onInputEvent=onInput;
     try {
         testGuestMemory();

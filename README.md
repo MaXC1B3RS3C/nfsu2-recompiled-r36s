@@ -1,5 +1,20 @@
 # Need for Speed Underground 2 — Recompiled
 
+
+### Android downloads / Descargas Android
+
+[Underground 2 v0.14.6](https://github.com/codepdbh/nfsu2-recompiled/releases/tag/v0.14.6)
+
+| APK | Architecture |
+|---|---|
+| [ARM64 / 64 bits](https://github.com/codepdbh/nfsu2-recompiled/releases/download/v0.14.6/NFSU2-AndroidEvolved-v0.14.6-arm64.apk) | arm64-v8a, recommended |
+| [ARMv7 / 32 bits](https://github.com/codepdbh/nfsu2-recompiled/releases/download/v0.14.6/NFSU2-AndroidEvolved-v0.14.6-armeabi-v7a.apk) | armeabi-v7a; requires Android with 32-bit app support |
+
+Android 10+ and Vulkan 1.1+. Both APKs use the same package and signing key;
+install the architecture supported by your device. Original game data is required.
+Audio, pacing and validation details: [runtime follow-up](docs/AUDIO_FRAME_PACING.md).
+Issue-driven changes and remaining limits: [16 October review](docs/ISSUE_REVIEW_2026_10_16.md).
+
 <div align="center">
 
 <img src="docs/images/logo.png" alt="NFSU2 Android Evolved Logo" width="220" />

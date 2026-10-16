@@ -101,8 +101,12 @@ public final class GameActivity extends NativeActivity {
             android.view.InputDevice device=android.view.InputDevice.getDevice(id);
             if(device==null||device.isVirtual())continue;
             int sources=device.getSources();
-            if((sources&android.view.InputDevice.SOURCE_GAMEPAD)==android.view.InputDevice.SOURCE_GAMEPAD||
-                    (sources&android.view.InputDevice.SOURCE_JOYSTICK)==android.view.InputDevice.SOURCE_JOYSTICK)connected=true;
+            boolean buttons=(sources&android.view.InputDevice.SOURCE_GAMEPAD)==android.view.InputDevice.SOURCE_GAMEPAD;
+            // Some fingerprint sensors advertise JOYSTICK with only a Z axis.
+            boolean stick=(sources&android.view.InputDevice.SOURCE_JOYSTICK)==android.view.InputDevice.SOURCE_JOYSTICK&&
+                    device.getMotionRange(android.view.MotionEvent.AXIS_X)!=null&&
+                    device.getMotionRange(android.view.MotionEvent.AXIS_Y)!=null;
+            if(buttons||stick)connected=true;
         }
         if(touchControls!=null)touchControls.setGamepadConnected(connected);
         nativeGamepadConnected(connected);
@@ -115,10 +119,12 @@ public final class GameActivity extends NativeActivity {
         }
     };
     private static native void nativeTypeText(String value, boolean replace);
+    private static native void nativePointer(float x, float y, int phase);
     private static native void nativeLanguage(String language);
     private static native void nativeResolution(int width, int height);
     private static native void nativeFrameLimit(int framesPerSecond);
     private static native void nativeWidescreen(boolean enabled);
+    private static native void nativeOnlineServer(String host);
     private static native void nativeGamepadConnected(boolean connected);
     private static native void nativeMinimapTop(boolean top);
     private static native void nativeBackBuffers(int count);
@@ -138,9 +144,9 @@ public final class GameActivity extends NativeActivity {
     private void showTextInput() {
         EditText name = new EditText(this);
         name.setSingleLine(true);
-        name.setHint("Nombre del perfil");
-        name.setFilters(new InputFilter[]{new InputFilter.LengthFilter(16)});
-        name.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS |
+        name.setHint("Nombre, correo o contraseña");
+        name.setFilters(new InputFilter[]{new InputFilter.LengthFilter(40)});
+        name.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD |
                 InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
         name.setImeOptions(EditorInfo.IME_ACTION_DONE | EditorInfo.IME_FLAG_NO_EXTRACT_UI);
         CheckBox replace = new CheckBox(this);
@@ -155,8 +161,8 @@ public final class GameActivity extends NativeActivity {
                 .create();
         dialog.setOnShowListener(ignored -> dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(button -> {
             String value = name.getText().toString();
-            if (value.isEmpty() || !value.matches("[A-Za-z0-9 ]{1,16}")) {
-                name.setError("Usa de 1 a 16 letras sin tildes, números o espacios");
+            if (value.isEmpty() || !value.matches("[A-Za-z0-9 .,=/;_+?:!@#$%&*()-]{1,40}")) {
+                name.setError("Hasta 40 caracteres: letras sin tildes, números y . , - _ @ + ! # $ % & * ( ) = ? / ; :");
                 return;
             }
             nativeTypeText(value, replace.isChecked());
@@ -192,6 +198,8 @@ public final class GameActivity extends NativeActivity {
         nativeLanguage(language != null ? language : GameOptions.language(this));
         nativeFrameLimit(launch.getIntExtra("frameCap", Integer.parseInt(GameOptions.get(this, GameOptions.FPS))));
         nativeWidescreen(launch.getBooleanExtra("widescreen", GameOptions.get(this, GameOptions.WIDESCREEN).equals("on")));
+        String server = launch.getStringExtra("onlineServer");
+        nativeOnlineServer(GameOptions.validServer(server) ? server : GameOptions.onlineServer(this));
         nativeMinimapTop(launch.getBooleanExtra("minimapTop", GameOptions.get(this, GameOptions.MINIMAP).equals("top")));
         nativeBackBuffers(launch.getIntExtra("backBuffers", Integer.parseInt(GameOptions.get(this, GameOptions.LATENCY))));
         nativeCpuTextures(launch.getBooleanExtra("cpuTextures", GameOptions.get(this, GameOptions.TEXTURES).equals("cpu")));
@@ -210,6 +218,7 @@ public final class GameActivity extends NativeActivity {
                 ViewGroup.LayoutParams.WRAP_CONTENT, false);
         statusWindow.setTouchable(false);
         touchControls = new RacingControlsView(this, this::setTouchKey, this::showTextInput,this::showTiltOptions,this::showFrameLimitOptions);
+        touchControls.setPointer(GameActivity::nativePointer);
         controlsWindow = new PopupWindow(touchControls, ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT, false);
         controlsWindow.setClippingEnabled(false);
@@ -251,8 +260,21 @@ public final class GameActivity extends NativeActivity {
             controlsWindow.showAtLocation(getWindow().getDecorView(), Gravity.TOP | Gravity.START, 0, 0);
         }
     }
+    // LAN games announce and discover themselves with UDP broadcasts on port 9999;
+    // without this lock many devices drop incoming Wi-Fi broadcasts to save power.
+    private android.net.wifi.WifiManager.MulticastLock lanBroadcasts;
+    private void holdLanBroadcasts(boolean hold) {
+        if (lanBroadcasts == null) {
+            android.net.wifi.WifiManager wifi = (android.net.wifi.WifiManager) getApplicationContext().getSystemService(WIFI_SERVICE);
+            if (wifi == null) return;
+            lanBroadcasts = wifi.createMulticastLock("nfsu2-lan");
+            lanBroadcasts.setReferenceCounted(false);
+        }
+        if (hold) lanBroadcasts.acquire(); else lanBroadcasts.release();
+    }
     @Override protected void onPause() {
         foreground=false;
+        holdLanBroadcasts(false);
         updateTiltSensor();
         if(inputManager!=null)inputManager.unregisterInputDeviceListener(gamepadListener);
         if (statusWindow != null) statusWindow.dismiss();
@@ -263,6 +285,7 @@ public final class GameActivity extends NativeActivity {
     @Override protected void onResume() {
         super.onResume();
         foreground=true;
+        holdLanBroadcasts(true);
         updateTiltSensor();
         if(inputManager!=null){inputManager.registerInputDeviceListener(gamepadListener,null);updateGamepads();}
         if(touchControls!=null) {touchControls.removeCallbacks(updateControlMode);touchControls.post(updateControlMode);}

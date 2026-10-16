@@ -41,10 +41,16 @@ foreach(source IN LISTS GEN_SOURCES)
         list(APPEND ANDROID_GEN_SOURCES "${source}")
     endif()
 endforeach()
+# server.dll (EA's LAN game server) lifted from a copy relocated to its guest
+# base: scripts/prepare_module.py + run_lift.py --prefix server_. Optional: a
+# build without it reports LAN hosting as unavailable instead of failing.
+set(SERVER_GEN_DIR "${NFS_ROOT}/src/recomp/gen_server")
+file(GLOB SERVER_GEN_SOURCES CONFIGURE_DEPENDS "${SERVER_GEN_DIR}/server_recomp_*.c")
+list(APPEND ANDROID_GEN_SOURCES ${SERVER_GEN_SOURCES})
 set_property(GLOBAL PROPERTY JOB_POOLS guest_compile=4)
 add_library(nfs_guest OBJECT ${ANDROID_GEN_SOURCES})
 set_property(TARGET nfs_guest PROPERTY JOB_POOL_COMPILE guest_compile)
-target_include_directories(nfs_guest PRIVATE "${PCRECOMP}/runtime/recomp32" "${GEN_DIR}")
+target_include_directories(nfs_guest PRIVATE "${PCRECOMP}/runtime/recomp32" "${GEN_DIR}" "${SERVER_GEN_DIR}")
 # RECOMP_LOCAL_REGS: guest registers live in locals of each lifted function
 # (written back at every call and return) so they stay in ARM64 registers.
 # RECOMP_MEM_QUAL=: guest memory accesses are not volatile; -fno-strict-aliasing
@@ -89,6 +95,9 @@ target_include_directories(nfsu2_android SYSTEM PRIVATE "${DXVK_SOURCE}/include/
   "${DXVK_SOURCE}/include/native/windows" "${DXVK_SOURCE}/include/native/directx")
 target_include_directories(nfsu2_android PRIVATE "${PCRECOMP}/runtime/recomp32" "${PCRECOMP}/runtime/win32hle" "${NFS_ROOT}/src/runtime")
 target_compile_definitions(nfsu2_android PRIVATE RECOMP_STRICT_ICALL RECOMP_X87_WINDOW)
+if(SERVER_GEN_SOURCES)
+    target_compile_definitions(nfsu2_android PRIVATE NFS_SERVER_DLL)
+endif()
 target_compile_features(nfsu2_android PRIVATE cxx_std_17)
 target_compile_definitions(nfsu2_android PRIVATE VK_USE_PLATFORM_ANDROID_KHR)
 target_compile_options(nfsu2_android PRIVATE -O2 -fno-strict-aliasing -ffp-contract=off -Wall -Wextra -Werror -Wno-missing-field-initializers)

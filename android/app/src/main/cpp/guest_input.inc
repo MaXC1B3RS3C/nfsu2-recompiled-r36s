@@ -254,6 +254,49 @@ bool joystickMethod(InputObject& object,uint32_t self,uint32_t method){
     default:return false;
     }
 }
+// Key names for GetObjectInfo (the controls screen shows them next to each action).
+std::string keyboardKeyName(uint32_t dik){
+    static const char* const row[]={nullptr,"Esc","1","2","3","4","5","6","7","8","9","0","-","=","Retroceso","Tab",
+        "Q","W","E","R","T","Y","U","I","O","P","[","]","Intro","Ctrl izq.","A","S","D","F","G","H","J","K","L",";","'","`",
+        "Mayus izq.","\\","Z","X","C","V","B","N","M",",",".","/","Mayus der.","* (num)","Alt izq.","Espacio","Bloq Mayus",
+        "F1","F2","F3","F4","F5","F6","F7","F8","F9","F10","Bloq Num","Bloq Despl","7 (num)","8 (num)","9 (num)","- (num)",
+        "4 (num)","5 (num)","6 (num)","+ (num)","1 (num)","2 (num)","3 (num)","0 (num)",". (num)"};
+    if(dik<sizeof row/sizeof row[0]&&row[dik])return row[dik];
+    switch(dik){
+    case 0x57:return "F11";case 0x58:return "F12";case 0x9c:return "Intro (num)";case 0x9d:return "Ctrl der.";
+    case 0xb5:return "/ (num)";case 0xb8:return "Alt der.";case 0xc5:return "Pausa";case 0xc7:return "Inicio";
+    case 0xc8:return "Arriba";case 0xc9:return "Re Pag";case 0xcb:return "Izquierda";case 0xcd:return "Derecha";
+    case 0xcf:return "Fin";case 0xd0:return "Abajo";case 0xd1:return "Av Pag";case 0xd2:return "Insert";case 0xd3:return "Supr";
+    }
+    char text[16];std::snprintf(text,sizeof text,"Tecla %02X",dik);return text;
+}
+// IDirectInputDevice8::GetObjectInfo(DIDEVICEOBJECTINSTANCEA*, dwObj, dwHow) for the
+// keyboard (objects are DIK codes, c_dfDIKeyboard offsets) and the mouse (DIMOUSESTATE2).
+void keyboardMouseObjectInfo(uint32_t kind){
+    uint32_t output=arg(1),objectId=arg(2),how=arg(3);
+    if(!output||(read32(output)!=316&&read32(output)!=280)){ret(diInvalid,4);return;}
+    if(how!=1&&how!=2){ret(diInvalid,4);return;}  // DIPH_BYOFFSET / DIPH_BYID
+    uint32_t offset=how==1?objectId:(objectId>>8)&0xffff;
+    std::string name;uint32_t type,guidData1;uint16_t guidData2=0xc9f3;
+    if(kind==2){
+        if(offset>255){ret(0x80070002,4);return;}  // DIERR_NOTFOUND
+        if(how==2&&!(objectId&0x0c)){ret(0x80070002,4);return;}
+        name=keyboardKeyName(offset);type=0x0cu|(offset<<8);guidData1=0x55728220u;guidData2=0xd33c;  // GUID_Key
+    }else{
+        static const char* const axes[]={"Eje X","Eje Y","Rueda"};
+        if(how==1&&offset<12&&offset%4==0){name=axes[offset/4];type=(offset==8?0x02u:0x01u)|((offset/4)<<8);guidData1=0xa36d02e0u+offset/4;}
+        else if(how==1&&offset>=12&&offset<20){name="Boton "+std::to_string(offset-12);type=0x04u|((offset-12)<<8);guidData1=0xa36d02f0u;}
+        else if(how==2&&(objectId&3)&&offset<3){name=axes[offset];type=objectId&0xffff03u;guidData1=0xa36d02e0u+offset;offset*=4;}
+        else if(how==2&&(objectId&0x0c)&&offset<8){name="Boton "+std::to_string(offset);type=objectId&0xffff0cu;guidData1=0xa36d02f0u;offset+=12;}
+        else{ret(0x80070002,4);return;}
+    }
+    uint32_t bytes=read32(output);std::memset(ptr(output+4,bytes-4),0,bytes-4);
+    const uint8_t tail[8]={0xbf,0xc7,0x44,0x45,0x53,0x54,0,0};uint16_t guidData3=0x11cf;
+    std::memcpy(ptr(output+4,4),&guidData1,4);std::memcpy(ptr(output+8,2),&guidData2,2);std::memcpy(ptr(output+10,2),&guidData3,2);std::memcpy(ptr(output+12,8),tail,8);
+    write32(output+20,offset);write32(output+24,type);write32(output+28,0);
+    std::memcpy(ptr(output+32,name.size()+1),name.c_str(),name.size()+1);
+    ret(0,4);
+}
 void inputDispatch(){
     uint32_t kind=(inputToken-inputMethodBase)/0x1000,method=((inputToken-inputMethodBase)%0x1000)/16;
     uint32_t self=arg(0);auto found=inputObjects.find(self);
@@ -314,6 +357,7 @@ void inputDispatch(){
         }
     }
     if(kind==4&&joystickMethod(object,self,method))return;
+    if(method==14){keyboardMouseObjectInfo(kind);return;}
     switch(method){
     case 3:{uint32_t output=arg(1);if(!output||read32(output)!=44){ret(diInvalid,2);return;}
         std::memset(ptr(output+4,40),0,40);write32(output+4,1);write32(output+8,kind==2?0x413:0x212);

@@ -1,6 +1,7 @@
 // Vulkan driver report for the launcher (GpuProbeActivity, own process). Based on the MW port's
 // android_diagnostico.cpp; the checks are what this port's DXVK d3d9 device enables unconditionally
 // (D3D9DeviceEx::GetDeviceFeatures), so "compatible" means the game's device can be created.
+#include "vertex_formats.h"
 #include "vulkan_driver.h"
 #include <jni.h>
 #include <dlfcn.h>
@@ -75,19 +76,15 @@ std::string probe(const char* hooks, const char* temp, const char* directory, co
     auto require = [&](bool supported, const char* name) { if (!supported) missing.emplace_back(name); };
     require(props.apiVersion >= VK_API_VERSION_1_1, "Vulkan 1.1");
     require(hasExtension(VK_KHR_SWAPCHAIN_EXTENSION_NAME), "VK_KHR_swapchain");
-    // Enabled unconditionally by the d3d9 device in this DXVK build.
+    // Enabled unconditionally by the d3d9 device in this DXVK build (clip/cull distance,
+    // geometry shaders, sample-rate shading, depth clamp and non-solid fill are optional
+    // here: Mali/PowerVR drivers lack them).
     require(features.robustBufferAccess, "robustBufferAccess");
     require(features.fullDrawIndexUint32, "fullDrawIndexUint32");
     require(features.imageCubeArray, "imageCubeArray");
     require(features.independentBlend, "independentBlend");
-    require(features.geometryShader, "geometryShader");
-    require(features.sampleRateShading, "sampleRateShading");
-    require(features.depthClamp, "depthClamp");
     require(features.depthBiasClamp, "depthBiasClamp");
-    require(features.fillModeNonSolid, "fillModeNonSolid");
     require(features.occlusionQueryPrecise, "occlusionQueryPrecise");
-    require(features.shaderClipDistance, "shaderClipDistance");
-    require(features.shaderCullDistance, "shaderCullDistance");
     require(features.shaderStorageImageWriteWithoutFormat, "shaderStorageImageWriteWithoutFormat");
 
     // DXT1/3/5 textures: on the GPU when BC is supported, otherwise decoded on the CPU (slower).
@@ -142,6 +139,7 @@ std::string probe(const char* hooks, const char* temp, const char* directory, co
         << ",\"logicalDeviceResult\":" << int(deviceResult)
         << ",\"driverLoadFailed\":" << (deviceResult == VK_SUCCESS ? "false" : "true")
         << ",\"bcTextures\":" << (bc ? "true" : "false")
+        << ",\"vertexFormatsMissing\":" << json(unsupportedD3DVertexFormats(gpu, vkGetPhysicalDeviceFormatProperties))
         << ",\"compatible\":" << (missing.empty() ? "true" : "false") << ",\"missing\":[";
     for (size_t i = 0; i < missing.size(); ++i) out << (i ? "," : "") << json(missing[i]);
     out << "]}";

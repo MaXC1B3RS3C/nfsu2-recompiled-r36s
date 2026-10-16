@@ -25,8 +25,10 @@ import java.util.zip.ZipOutputStream;
 
 /**
  * Crash detection and tester reports (after the MW port). Reports contain this app's own log, the
- * device and the launcher options; never game files or saves. Nothing is uploaded automatically:
- * the player saves the ZIP and attaches it to the GitHub issue the launcher opens.
+ * device and the launcher options; never game files or saves. Nothing is uploaded automatically.
+ * GitHub cannot take an attachment through the new-issue link, so the issue body carries a compact
+ * technical summary of the game log, and the full ZIP is saved to Download/NFSU2 for the player to
+ * attach.
  */
 final class Diagnostics {
     static final String ISSUES = "https://github.com/codepdbh/nfsu2-recompiled/issues/new";
@@ -61,6 +63,7 @@ final class Diagnostics {
     static String summary(Context context) {
         GpuDrivers.Driver driver = GpuDrivers.selected(context);
         return "NFSU2 Android Evolved " + ReleaseUpdates.installed(context)
+                + "\nAPK ABI: " + (Process.is64Bit() ? "arm64-v8a" : "armeabi-v7a")
                 + "\nTeléfono: " + Build.MANUFACTURER + " " + Build.MODEL
                 + "\nAndroid: " + Build.VERSION.RELEASE + " (API " + Build.VERSION.SDK_INT + ")"
                 + "\nSoC: " + (Build.VERSION.SDK_INT >= 31 ? Build.SOC_MANUFACTURER + " " + Build.SOC_MODEL : Build.HARDWARE)
@@ -93,22 +96,77 @@ final class Diagnostics {
         return report;
     }
 
-    /** The last lines of this app's log, for the issue body. */
+    /** The last game lines (runtime, DXVK, crashes) of this app's log, for the issue body. */
     static String logTail(int lines) {
-        try { return new String(logcat(lines), StandardCharsets.UTF_8); }
+        try { return new String(logcat(lines, "NFSU2:I", "DXVK:W", "AndroidRuntime:E", "DEBUG:F", "libc:F", "*:S"), StandardCharsets.UTF_8); }
         catch (IOException error) { return error.toString(); }
     }
 
-    static Uri issueUri(Context context, String crash, String zipName) {
-        String tail = logTail(60);
-        if (tail.length() > 5000) tail = tail.substring(tail.length() - 5000);
-        String body = "### Qué ocurrió\n" + (crash == null ? "" : crash + "\n") + "\n### Pasos para reproducirlo\n\n"
-                + "### Dispositivo\n" + summary(context)
-                + "\n### Registro completo\nAdjunta aquí el archivo **" + zipName + "** que acabas de guardar.\n"
-                + "\n### Últimas líneas del registro\n```\n" + tail + "\n```\n";
-        return Uri.parse(ISSUES).buildUpon()
-                .appendQueryParameter("title", "[Android] " + Build.MODEL + ": " + (crash == null ? "" : "cierre inesperado"))
-                .appendQueryParameter("body", body).build();
+    // Lines that explain a stop, a stall or a missing piece of the Windows layer.
+    private static final java.util.regex.Pattern KEY_LINE = java.util.regex.Pattern.compile(
+            "stopped|boundary|pendiente|unresolved|stall|  thread |FATAL|Fatal|SIGSEGV|SIGBUS|abort|DeadSystem|E DXVK|MessageBox"
+            // Native crash frames inside our libraries (symbolized later with symbols-vX.Y.Z).
+            + "|#[01][0-9] pc [0-9a-f]+ .*libnfsu2");
+    // Per-frame or per-file chatter that crowds out the useful part of the tail.
+    private static final java.util.regex.Pattern NOISE = java.util.regex.Pattern.compile(
+            "Guest file |touch DIK|Keyboard buffered|D3D9 COM|Guest timer|Guest import|Guest LoadLibrary d3d9|VirtualProtect|presentation");
+    // GitHub refuses the new-issue link past roughly 8 KB once it is URL-encoded.
+    private static final int URL_BUDGET = 7500;
+
+    /** "20:30:40.892 W text" from a threadtime line, to save room in the link. */
+    private static String compact(String line) {
+        String[] parts = line.trim().split("\\s+", 6);
+        if (parts.length < 6) return line;
+        String message = parts[5];
+        int colon = message.indexOf(": ");
+        return parts[1] + " " + parts[4] + " " + (colon >= 0 ? message.substring(colon + 2) : message);
+    }
+
+    static Uri issueUri(Context context, String crash, String zipLocation) {
+        List<String> key = new java.util.ArrayList<>(), tail = new java.util.ArrayList<>();
+        String lastFrame = null;
+        for (String line : logTail(0).split("\n")) {
+            if (line.contains("presentation")) lastFrame = compact(line);
+            if (KEY_LINE.matcher(line).find()) key.add(compact(line));
+            else if (line.contains(" NFSU2 ") && !NOISE.matcher(line).find()) tail.add(compact(line));
+        }
+        if (key.size() > 35) key = key.subList(key.size() - 35, key.size());
+        if (tail.size() > 60) tail = tail.subList(tail.size() - 60, tail.size());
+        String title = "[Android] " + Build.MODEL + ": " + (crash == null ? "" : "cierre inesperado");
+        while (true) {
+            String body = "### Qué ocurrió\n" + (crash == null ? "" : crash + "\n") + "\n### Pasos para reproducirlo\n\n"
+                    + "### Dispositivo\n" + summary(context)
+                    + "\n### Registro completo\nGuardado en el móvil en **" + zipLocation
+                    + "**. Si puedes, adjúntalo aquí: arrástralo o toca \"Paste, drop, or click to add files\".\n"
+                    + "\n### Resumen técnico\n```\n" + String.join("\n", key)
+                    + (lastFrame == null ? "" : "\nÚltimo fotograma: " + lastFrame)
+                    + "\n--- últimas líneas del juego ---\n" + String.join("\n", tail) + "\n```\n";
+            Uri uri = Uri.parse(ISSUES).buildUpon().appendQueryParameter("title", title).appendQueryParameter("body", body).build();
+            if (uri.toString().length() <= URL_BUDGET || (tail.isEmpty() && key.size() <= 1)) return uri;
+            if (!tail.isEmpty()) tail = tail.subList(Math.min(tail.size(), 5), tail.size());
+            else key = key.subList(1, key.size());
+        }
+    }
+
+    /** Copies the report to Download/NFSU2 (MediaStore: an app needs no permission for its own files). */
+    static String saveToDownloads(Context context, File report) throws IOException {
+        android.content.ContentValues values = new android.content.ContentValues();
+        values.put(android.provider.MediaStore.MediaColumns.DISPLAY_NAME, report.getName());
+        values.put(android.provider.MediaStore.MediaColumns.MIME_TYPE, "application/zip");
+        values.put(android.provider.MediaStore.MediaColumns.RELATIVE_PATH, android.os.Environment.DIRECTORY_DOWNLOADS + "/NFSU2");
+        android.content.ContentResolver resolver = context.getContentResolver();
+        Uri target = resolver.insert(android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI, values);
+        if (target == null) throw new IOException("No se pudo crear el archivo en Descargas.");
+        try (InputStream input = new java.io.FileInputStream(report);
+             java.io.OutputStream output = resolver.openOutputStream(target, "w")) {
+            if (output == null) throw new IOException("No se pudo escribir en Descargas.");
+            byte[] buffer = new byte[65536];
+            for (int n; (n = input.read(buffer)) != -1;) output.write(buffer, 0, n);
+        } catch (IOException error) {
+            resolver.delete(target, null, null);
+            throw error;
+        }
+        return "Descargas/NFSU2/" + report.getName();
     }
 
     private static void add(ZipOutputStream zip, String name, byte[] data) throws IOException {
@@ -129,12 +187,16 @@ final class Diagnostics {
     }
 
     /** This app's main and crash log buffers (all processes of our uid); lines = 0 for the whole buffer. */
-    private static byte[] logcat(int lines) throws IOException {
+    private static byte[] logcat(int lines, String... filters) throws IOException {
         java.lang.Process process = null;
         try {
             List<String> command = new java.util.ArrayList<>(Arrays.asList("logcat", "-d", "-b", "main", "-b", "crash",
                     "-v", "threadtime", "--uid=" + Process.myUid()));
             if (lines > 0) { command.add("-t"); command.add(String.valueOf(lines)); }
+            command.addAll(Arrays.asList(filters));
+            // Android 11's logcat has no --uid (the report came back empty); an app only reads
+            // its own uid's log there anyway.
+            if (Build.VERSION.SDK_INT < 31) command.remove("--uid=" + Process.myUid());
             process = new ProcessBuilder(command).redirectErrorStream(true).start();
             java.lang.Process active = process;
             Thread timeout = new Thread(() -> {

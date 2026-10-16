@@ -1,5 +1,6 @@
 """Prepare the pinned zlib-licensed DXVK native 1.9.2b for Android ARM64."""
 import argparse
+import hashlib
 import pathlib
 import shutil
 import subprocess
@@ -48,6 +49,50 @@ replace("src/d3d9/d3d9_device.cpp", '    enabled.core.features.multiViewport = V
 # already recycled: reset them first in reset(), not later in beginRecording().
 replace("src/dxvk/dxvk_cmdlist.cpp", '    if ((m_graphicsPool && m_vkd->vkResetCommandPool(m_vkd->device(), m_graphicsPool, 0) != VK_SUCCESS)\n     || (m_transferPool && m_vkd->vkResetCommandPool(m_vkd->device(), m_transferPool, 0) != VK_SUCCESS))\n      Logger::err("DxvkCommandList: Failed to reset command buffer");\n    ', '    // Command pools were reset in reset(), once the GPU finished with them.\n    ')
 replace("src/dxvk/dxvk_cmdlist.cpp", '  void DxvkCommandList::reset() {\n    // Signal resources and events to\n    // avoid stalling main thread\n    m_signalTracker.reset();', '  void DxvkCommandList::reset() {\n    // Reset the command buffers while everything they reference still exists.\n    // Recycling descriptor pools and releasing resources first is legal, but\n    // the 2020 Adreno 6xx driver (Redmi Note 8, Adreno 610) then follows freed\n    // descriptor state while resetting and calls through a null pointer.\n    if ((m_graphicsPool && m_vkd->vkResetCommandPool(m_vkd->device(), m_graphicsPool, 0) != VK_SUCCESS)\n     || (m_transferPool && m_vkd->vkResetCommandPool(m_vkd->device(), m_transferPool, 0) != VK_SUCCESS))\n      Logger::err("DxvkCommandList: Failed to reset command buffer");\n\n    // Signal resources and events to\n    // avoid stalling main thread\n    m_signalTracker.reset();')
+# Mali: no clip/cull distances (its compiler crashes on them) and no geometry shaders;
+# PowerVR: no sample-rate shading. Enable those only where supported.
+replace('src/d3d9/d3d9_device.cpp', '    enabled.core.features.shaderClipDistance = VK_TRUE;\n    enabled.core.features.shaderCullDistance = VK_TRUE;\n', '    // Mali has no clip/cull distances and its compiler crashes (null pointer in\n    // cmpbe_v2_compile_multiple_shaders) on shaders that write them, even though\n    // vkCreateDevice accepts the feature. Without it, shaders skip user clip planes.\n    enabled.core.features.shaderClipDistance = supported.core.features.shaderClipDistance;\n    enabled.core.features.shaderCullDistance = supported.core.features.shaderCullDistance;\n    g_d3d9ClipDistance = supported.core.features.shaderClipDistance;\n')
+replace('src/d3d9/d3d9_device.cpp', '    enabled.core.features.geometryShader = VK_TRUE;\n', '    enabled.core.features.geometryShader = supported.core.features.geometryShader;\n')
+replace('src/d3d9/d3d9_device.cpp', '    enabled.core.features.sampleRateShading = VK_TRUE;\n', '    enabled.core.features.sampleRateShading = supported.core.features.sampleRateShading;\n')
+replace('src/d3d9/d3d9_device.cpp', 'namespace dxvk {\n', 'namespace dxvk {\n\n  // Whether vertex shaders may write gl_ClipDistance (set per device creation).\n  bool g_d3d9ClipDistance = true;\n')
+replace('src/dxso/dxso_compiler.cpp', '  void DxsoCompiler::emitVsInit() {\n    m_module.enableCapability(spv::CapabilityClipDistance);\n', '  void DxsoCompiler::emitVsInit() {\n    if (g_d3d9ClipDistance)\n      m_module.enableCapability(spv::CapabilityClipDistance);\n')
+replace('src/dxso/dxso_compiler.cpp', '    this->emitLinkerOutputSetup();\n\n    this->emitVsClipping();\n', '    this->emitLinkerOutputSetup();\n\n    if (g_d3d9ClipDistance)\n      this->emitVsClipping();\n')
+replace('src/dxso/dxso_compiler.cpp', 'namespace dxvk {\n', 'namespace dxvk {\n\n  extern bool g_d3d9ClipDistance;\n')
+replace('src/d3d9/d3d9_fixed_function.cpp', '    // VS Caps\n    m_module.enableCapability(spv::CapabilityClipDistance);\n', '    // VS Caps\n    if (g_d3d9ClipDistance)\n      m_module.enableCapability(spv::CapabilityClipDistance);\n')
+replace('src/d3d9/d3d9_fixed_function.cpp', '    if (m_vsKey.Data.Contents.VertexClipping)\n      emitVsClipping(vtx);\n', '    if (m_vsKey.Data.Contents.VertexClipping && g_d3d9ClipDistance)\n      emitVsClipping(vtx);\n')
+replace('src/d3d9/d3d9_fixed_function.cpp', 'namespace dxvk {\n', 'namespace dxvk {\n\n  extern bool g_d3d9ClipDistance;\n')
+# DXVK warnings and errors reach logcat (tag DXVK) for tester reports.
+replace('src/util/log/log.cpp', '#include "log.h"\n', '#include "log.h"\n#ifdef __ANDROID__\n#include <android/log.h>\n#endif\n')
+replace('src/util/log/log.cpp', '        std::cerr << prefix << line << std::endl;\n', '        std::cerr << prefix << line << std::endl;\n#ifdef __ANDROID__\n        // stderr goes nowhere on Android: send warnings and errors to logcat,\n        // so tester reports (logcat.txt) show why DXVK failed.\n        if (level >= LogLevel::Warn)\n          __android_log_print(level >= LogLevel::Error ? ANDROID_LOG_ERROR : ANDROID_LOG_WARN, "DXVK", "%s", line.c_str());\n#endif\n')
 (args.output / "version.h").write_text('#define DXVK_VERSION "native-1.9.2b-android-arm64"\n')
 (args.output / "PINNED_REVISION").write_text(PIN + "\n")
 print("Prepared DXVK " + PIN)
+
+# Mali-G52/G57/G76 drivers lack depthClamp and fillModeNonSolid (CreateDevice
+# D3DERR_NOTAVAILABLE): request them only when supported.
+replace('src/d3d9/d3d9_device.cpp', '    enabled.core.features.depthClamp = VK_TRUE;\n', '    // Mali-G52/G57/G76 drivers have no depthClamp: D3D9 always clips depth, so\n    // pipelines only need it when the device has it (g_dxvkDepthClamp).\n    enabled.core.features.depthClamp = supported.core.features.depthClamp;\n    g_dxvkDepthClamp = supported.core.features.depthClamp;\n')
+replace('src/d3d9/d3d9_device.cpp', '    enabled.core.features.fillModeNonSolid = VK_TRUE;\n', '    // Without it D3DFILL_WIREFRAME/POINT draw filled (see the rasterizer state).\n    enabled.core.features.fillModeNonSolid = supported.core.features.fillModeNonSolid;\n')
+replace('src/d3d9/d3d9_device.cpp', '    state.polygonMode     = DecodeFillMode(D3DFILLMODE(rs[D3DRS_FILLMODE]));\n', '    state.polygonMode     = DecodeFillMode(D3DFILLMODE(rs[D3DRS_FILLMODE]));\n    if (!m_dxvkDevice->features().core.features.fillModeNonSolid)\n      state.polygonMode   = VK_POLYGON_MODE_FILL;\n')
+replace('src/d3d9/d3d9_device.cpp', 'namespace dxvk {\n', 'namespace dxvk {\n  extern bool g_dxvkDepthClamp;\n')
+replace('src/dxvk/dxvk_graphics.cpp', 'namespace dxvk {\n', 'namespace dxvk {\n  // False when the device lacks depthClamp (set before device creation).\n  bool g_dxvkDepthClamp = true;\n')
+replace('src/dxvk/dxvk_graphics.cpp', '    rsInfo.depthClampEnable       = VK_TRUE;\n', '    rsInfo.depthClampEnable       = g_dxvkDepthClamp;\n')
+replace('src/dxvk/dxvk_graphics.cpp', '      rsInfo.depthClampEnable = !state.rs.depthClipEnable();\n', '      rsInfo.depthClampEnable = g_dxvkDepthClamp && !state.rs.depthClipEnable();\n')
+replace('src/dxvk/dxvk_meta_blit.cpp', 'namespace dxvk {\n', 'namespace dxvk {\n  extern bool g_dxvkDepthClamp;\n')
+replace('src/dxvk/dxvk_meta_blit.cpp', '    rsState.depthClampEnable    = VK_TRUE;\n', '    rsState.depthClampEnable    = g_dxvkDepthClamp;\n')
+replace('src/dxvk/dxvk_meta_copy.cpp', 'namespace dxvk {\n', 'namespace dxvk {\n  extern bool g_dxvkDepthClamp;\n')
+replace('src/dxvk/dxvk_meta_copy.cpp', '    rsState.depthClampEnable    = VK_TRUE;\n', '    rsState.depthClampEnable    = g_dxvkDepthClamp;\n')
+replace('src/dxvk/dxvk_meta_resolve.cpp', 'namespace dxvk {\n', 'namespace dxvk {\n  extern bool g_dxvkDepthClamp;\n')
+replace('src/dxvk/dxvk_meta_resolve.cpp', '    rsState.depthClampEnable    = VK_TRUE;\n', '    rsState.depthClampEnable    = g_dxvkDepthClamp;\n')
+
+# Reset on Mali: log why the swap chain could not be recreated.
+replace('src/d3d9/d3d9_swapchain.cpp', '    if (m_presenter->recreateSwapChain(presenterDesc) != VK_SUCCESS)\n      throw DxvkError("D3D9SwapChainEx: Failed to recreate swap chain");\n', '    VkResult recreated = m_presenter->recreateSwapChain(presenterDesc);\n    if (recreated != VK_SUCCESS) {\n      Logger::err(str::format("D3D9SwapChainEx: Failed to recreate swap chain: ", recreated,\n        " (", presenterDesc.imageExtent.width, "x", presenterDesc.imageExtent.height, ")"));\n      throw DxvkError("D3D9SwapChainEx: Failed to recreate swap chain");\n    }\n')
+# Reset after a failed back buffer allocation: no null back buffers.
+replace("src/d3d9/d3d9_swapchain.cpp", '  void D3D9SwapChainEx::DestroyBackBuffers() {\n    for (auto& backBuffer : m_backBuffers)\n      backBuffer->ClearContainer();\n', '  void D3D9SwapChainEx::DestroyBackBuffers() {\n    // Entries stay null when a previous CreateBackBuffers threw half way.\n    for (auto& backBuffer : m_backBuffers)\n      if (backBuffer != nullptr)\n        backBuffer->ClearContainer();\n')
+replace("src/d3d9/d3d9_swapchain.cpp", '    for (uint32_t i = 0; i < m_backBuffers.size(); i++)\n      m_backBuffers[i] = new D3D9Surface(m_parent, &desc, this);\n', '    // Android: allocating the images can fail (out of device memory on Reset,\n    // MediaTek/Unisoc reports). Leave no null entries behind for the next\n    // Reset, which used to crash in ClearContainer.\n    try {\n      for (uint32_t i = 0; i < m_backBuffers.size(); i++)\n        m_backBuffers[i] = new D3D9Surface(m_parent, &desc, this);\n    } catch (...) {\n      DestroyBackBuffers();\n      throw;\n    }\n')
+# Persistent VkPipelineCache (pipeline_cache.cpp): no recompiling every pipeline each session.
+replace("src/vulkan/vulkan_presenter.cpp", '    m_vkd->vkDestroySwapchainKHR(m_vkd->device(), m_swapchain, nullptr);', '    if (m_swapchain != VK_NULL_HANDLE)\n      m_vkd->vkDestroySwapchainKHR(m_vkd->device(), m_swapchain, nullptr);')
+replace("src/vulkan/vulkan_presenter.cpp", '    m_vki->vkDestroySurfaceKHR(m_vki->instance(), m_surface, nullptr);', '    if (m_surface != VK_NULL_HANDLE)\n      m_vki->vkDestroySurfaceKHR(m_vki->instance(), m_surface, nullptr);\n    m_surface = VK_NULL_HANDLE;')
+shutil.copy2(pathlib.Path(__file__).parent / "pipeline_cache.cpp", args.output / "src/dxvk/dxvk_pipecache.cpp")
+shutil.copy2(pathlib.Path(__file__).parent / "pipeline_cache.h", args.output / "src/dxvk/dxvk_pipecache.h")
+replace("src/dxvk/dxvk_pipemanager.cpp", '    m_cache     (new DxvkPipelineCache(device->vkd())) {', '    m_cache     (new DxvkPipelineCache(device->vkd(), device->properties().core.properties)) {')
+(args.output / "ANDROID_PREPARE_SHA256").write_text(hashlib.sha256(pathlib.Path(__file__).read_bytes()).hexdigest() + "\n", encoding="ascii")

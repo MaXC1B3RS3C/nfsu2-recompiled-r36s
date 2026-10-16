@@ -6,13 +6,16 @@
       function's BASIC BLOCK ranges, so lifting can re-decode without paying
       for the whole discovery again (it takes ~12 minutes on SPEED2.EXE).
 
-  run_lift.py lift  <analysis.exe> <catalog.json> <outdir> [--split N] [--names names.json]
+  run_lift.py lift  <analysis.exe> <catalog.json> <outdir> [--split N] [--names names.json] [--prefix P]
       Lift every catalogued function with lift32.Lifter and write:
         recomp_NNNN.c          the functions, N per file
         recomp_funcs.h         declarations
         recomp_dispatch.c      sorted VA -> function table (binary search)
         recomp_imports.c       IAT slot VA -> "dll!name" (for crash trails)
         lift_stats.json        counts for docs/LIFT_REPORT.md
+      --prefix P names a second module's output (P + every file and table
+      above, e.g. server_recomp_dispatch_table for server.dll) so it links
+      next to SPEED2.EXE's.
 
 Everything written here is derived from the game binary and is gitignored.
 """
@@ -86,11 +89,12 @@ def read_va_list(path):
     return out
 
 
-def cmd_lift(exe, catalog, outdir, split=400, names_path=None):
+def cmd_lift(exe, catalog, outdir, split=400, names_path=None, prefix=""):
     import pefile
     from lift32 import Lifter
     info = analyze_pe(exe)
     iat = build_iat_map(info)
+    module = os.path.basename(exe)
     pe = pefile.PE(exe, fast_load=True)
     base = pe.OPTIONAL_HEADER.ImageBase
     img = pe.get_memory_mapped_image()
@@ -110,7 +114,7 @@ def cmd_lift(exe, catalog, outdir, split=400, names_path=None):
                     hook_sites=set(hooks))
     os.makedirs(outdir, exist_ok=True)
     for fn in os.listdir(outdir):
-        if fn.startswith("recomp_") and fn.endswith((".c", ".h")):
+        if fn.startswith(prefix + "recomp_") and fn.endswith((".c", ".h")):
             os.remove(os.path.join(outdir, fn))
 
     stats = collections.Counter()
@@ -125,10 +129,10 @@ def cmd_lift(exe, catalog, outdir, split=400, names_path=None):
         nonlocal chunk, idx, lines_total
         if not chunk:
             return
-        p = os.path.join(outdir, f"recomp_{idx:04d}.c")
+        p = os.path.join(outdir, f"{prefix}recomp_{idx:04d}.c")
         with open(p, "w", newline="\n") as fh:
-            fh.write("/* AUTO-GENERATED from SPEED2.EXE by run_lift.py (pcrecomp lift32). DO NOT EDIT, DO NOT COMMIT. */\n")
-            fh.write('#define RECOMP_GENERATED_CODE\n#include "recomp_types.h"\n#include "recomp_funcs.h"\n#include <math.h>\n#include <string.h>\n\n')
+            fh.write(f"/* AUTO-GENERATED from {module} by run_lift.py (pcrecomp lift32). DO NOT EDIT, DO NOT COMMIT. */\n")
+            fh.write(f'#define RECOMP_GENERATED_CODE\n#include "recomp_types.h"\n#include "{prefix}recomp_funcs.h"\n#include <math.h>\n#include <string.h>\n\n')
             body = "\n\n".join(chunk)
             fh.write(body)
             lines_total += body.count("\n")
@@ -172,21 +176,21 @@ def cmd_lift(exe, catalog, outdir, split=400, names_path=None):
             print(f"[*] {n + 1}/{len(fds)} lifted ({el:.0f}s)", flush=True)
     flush()
 
-    with open(os.path.join(outdir, "recomp_funcs.h"), "w", newline="\n") as fh:
+    with open(os.path.join(outdir, f"{prefix}recomp_funcs.h"), "w", newline="\n") as fh:
         fh.write("/* AUTO-GENERATED. DO NOT EDIT. */\n#pragma once\n#include <stdint.h>\n")
         for a in entries:
             fh.write(f"void sub_{a:08X}(void);\n")
-    with open(os.path.join(outdir, "recomp_dispatch.c"), "w", newline="\n") as fh:
-        fh.write('/* AUTO-GENERATED. DO NOT EDIT. */\n#include "recomp_types.h"\n#include "recomp_funcs.h"\n\n')
-        fh.write("const recomp_dispatch_entry_t recomp_dispatch_table[] = {\n")
+    with open(os.path.join(outdir, f"{prefix}recomp_dispatch.c"), "w", newline="\n") as fh:
+        fh.write(f'/* AUTO-GENERATED. DO NOT EDIT. */\n#include "recomp_types.h"\n#include "{prefix}recomp_funcs.h"\n\n')
+        fh.write(f"const recomp_dispatch_entry_t {prefix}recomp_dispatch_table[] = {{\n")
         for a in sorted(entries):
             fh.write(f"    {{ 0x{a:08X}u, sub_{a:08X} }},\n")
         fh.write("};\n")
-        fh.write(f"const uint32_t recomp_dispatch_count = {len(entries)};\n")
-    with open(os.path.join(outdir, "recomp_imports.c"), "w", newline="\n") as fh:
+        fh.write(f"const uint32_t {prefix}recomp_dispatch_count = {len(entries)};\n")
+    with open(os.path.join(outdir, f"{prefix}recomp_imports.c"), "w", newline="\n") as fh:
         fh.write("/* AUTO-GENERATED: IAT slot -> import name, for diagnostics. */\n#include <stdint.h>\n")
         fh.write("typedef struct { uint32_t slot; const char* name; } nfs_import_name_t;\n")
-        fh.write("const nfs_import_name_t nfs_import_names[] = {\n")
+        fh.write(f"const nfs_import_name_t {prefix}nfs_import_names[] = {{\n")
         for slot, (dll, nm) in sorted(iat.items()):
             fh.write(f'    {{ 0x{slot:08X}u, "{dll}!{nm}" }},\n')
         fh.write("    { 0, 0 } };\n")
@@ -199,7 +203,7 @@ def cmd_lift(exe, catalog, outdir, split=400, names_path=None):
            "overridden": stats["overridden"], "excluded": stats["excluded"],
            "icall_sites": stats["icall_sites"], "itail_sites": stats["itail_sites"],
            "seconds": round(time.time() - t0)}
-    json.dump(out, open(os.path.join(outdir, "lift_stats.json"), "w"), indent=1)
+    json.dump(out, open(os.path.join(outdir, f"{prefix}lift_stats.json"), "w"), indent=1)
     print(json.dumps({k: v for k, v in out.items() if k not in ("failures", "unimplemented_sites")}, indent=1))
 
 
@@ -210,6 +214,7 @@ if __name__ == "__main__":
     elif a and a[0] == "lift":
         split = int(a[a.index("--split") + 1]) if "--split" in a else 400
         names = a[a.index("--names") + 1] if "--names" in a else None
-        cmd_lift(a[1], a[2], a[3], split, names)
+        prefix = a[a.index("--prefix") + 1] if "--prefix" in a else ""
+        cmd_lift(a[1], a[2], a[3], split, names, prefix)
     else:
         sys.exit(__doc__)

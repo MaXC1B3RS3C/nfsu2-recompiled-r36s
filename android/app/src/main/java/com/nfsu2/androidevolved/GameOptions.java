@@ -69,6 +69,18 @@ final class GameOptions {
         prefs(context).edit().putString(key, value).apply();
     }
 
+    static final String ONLINE_SERVER = "online_server", DEFAULT_ONLINE_SERVER = "eahub.eu";
+
+    /** EA Nation replacement server: the game's *.ea.com hosts resolve to this name or IPv4 address. */
+    static String onlineServer(Context context) {
+        String value = prefs(context).getString(ONLINE_SERVER, DEFAULT_ONLINE_SERVER);
+        return validServer(value) ? value : DEFAULT_ONLINE_SERVER;
+    }
+
+    static boolean validServer(String value) {
+        return value != null && value.length() <= 253 && value.matches("[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*");
+    }
+
     /** The game's language folder name (LANGUAGES/<file>.bin) chosen in the launcher. */
     static String language(Context context) {
         return prefs(context).getString(LANGUAGE, "Spanish");

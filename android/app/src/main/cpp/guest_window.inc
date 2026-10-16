@@ -94,10 +94,39 @@ void enqueueGuestKey(unsigned scan,bool down){
     if(!key)return;uint32_t flags=1|((scan&0x7f)<<16)|((scan&0x80)?1u<<24:0)|(!down?0xc0000000u:0)|(guestShiftDown.load()?1u<<25:0);
     std::lock_guard<std::mutex> lock(messageMutex);windowMessages.push_back({0,down?0x100u:0x101u,key,flags,messageTime()});
 }
+// Android text entry: the game's window procedure reads typed text from WM_CHAR
+// (wParam is the character as-is, 8 = backspace), so post the characters directly.
+void enqueueGuestText(const std::vector<uint32_t>& characters){
+    std::lock_guard<std::mutex> lock(messageMutex);
+    for(uint32_t ch:characters)windowMessages.push_back({0,0x102u,ch,1u,messageTime()});
+}
+// Touch as mouse: Android writes the pointer as a fraction of the game view; it is
+// turned into client coordinates of the active window under the machine lock.
+std::atomic<float> guestPointerX{0.5f},guestPointerY{0.5f};
+constexpr uint32_t pointerPending=0xffffffffu;  // lParam placeholder of queued mouse messages
+uint32_t captureWindow{};
+std::pair<int32_t,int32_t> pointerInWindow(){
+    auto window=windows.find(activeWindow);
+    if(window==windows.end())return {0,0};
+    int32_t width=std::max(window->second.width,1),height=std::max(window->second.height,1);
+    return {std::min(int32_t(guestPointerX.load()*float(width)),width-1),std::min(int32_t(guestPointerY.load()*float(height)),height-1)};
+}
+void enqueueGuestPointer(int phase){  // 0 down, 1 move, 2 up
+    std::lock_guard<std::mutex> lock(messageMutex);
+    windowMessages.push_back({0,0x200u,phase==2?0u:1u,pointerPending,messageTime()});
+    if(phase==0)windowMessages.push_back({0,0x201u,1u,pointerPending,messageTime()});
+    if(phase==2)windowMessages.push_back({0,0x202u,0u,pointerPending,messageTime()});
+}
+void setCapture(){uint32_t old=captureWindow;captureWindow=windows.count(arg(0))?arg(0):0;ret(old,1);}
+void releaseCapture(){captureWindow=0;ret(1,0);}
 bool takeWindowMessage(uint32_t output,uint32_t handle,uint32_t minimum,uint32_t maximum,bool remove){
     std::lock_guard<std::mutex> lock(messageMutex);
     for(auto it=windowMessages.begin();it!=windowMessages.end();++it){
-        GuestMessage value=*it;if(!value.hwnd&&value.message>=0x100&&value.message<=0x109)value.hwnd=activeWindow;
+        GuestMessage value=*it;if(!value.hwnd&&((value.message>=0x100&&value.message<=0x109)||(value.message>=0x200&&value.message<=0x20d)))value.hwnd=activeWindow;
+        if(value.message>=0x200&&value.message<=0x20d&&value.lparam==pointerPending){
+            auto point=pointerInWindow();value.lparam=uint32_t(point.first&0xffff)|uint32_t(point.second&0xffff)<<16;
+            if(auto window=windows.find(value.hwnd);window!=windows.end()){value.x=window->second.x+point.first;value.y=window->second.y+point.second;}
+        }
         if(value.message!=0x12&&((handle&&handle!=value.hwnd)||((minimum||maximum)&&(value.message<minimum||value.message>maximum))))continue;
         std::memcpy(ptr(output,28),&value,28);if(remove)windowMessages.erase(it);return true;
     }
