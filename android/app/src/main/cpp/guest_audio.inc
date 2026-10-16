@@ -74,7 +74,6 @@ void serviceGuestSound(){
         soundCallbackPeakUs.exchange(0,std::memory_order_relaxed),int(AAudioStream_getPerformanceMode(soundStream)));
 }
 #elif defined(NFS_SDL_AUDIO)
-#include <SDL2/SDL.h>
 static SDL_AudioDeviceID s_sdlAudioDevice = 0;
 static void sdlAudioCallback(void*, Uint8* stream, int len) {
     unsigned frames = unsigned(len / (sizeof(float) * 2));
@@ -98,7 +97,6 @@ bool startSoundStream() {
     SDL_PauseAudioDevice(s_sdlAudioDevice, 0);
     NFS_RUNTIME_LOG(ANDROID_LOG_INFO, "NFSU2", "SDL2 stereo float audio started: %u Hz", soundMixer.rate);
     return true;
-}
 }
 #else
 void serviceGuestSound(){}

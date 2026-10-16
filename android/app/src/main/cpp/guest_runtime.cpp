@@ -34,7 +34,19 @@
 #include <deque>
 #ifdef __ANDROID__
 #include <aaudio/AAudio.h>
+#elif defined(NFS_SDL_AUDIO)
+#include <SDL2/SDL.h>
 #endif
+#include <arpa/inet.h>
+#include <ifaddrs.h>
+#include <net/if.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <poll.h>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
+
 extern "C" {
 #include "recomp_types.h"
 #include "pe_format.h"
