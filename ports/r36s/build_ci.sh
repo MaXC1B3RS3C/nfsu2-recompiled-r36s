@@ -34,12 +34,13 @@ if [ ! -d "$PCRECOMP/runtime/recomp32" ]; then
     echo "[INFO] Setting up pcrecomp..."
     mkdir -p "$(dirname "$PCRECOMP")"
     if [ ! -d "$PCRECOMP/.git" ]; then
-        git clone --depth 1 https://github.com/sp00nznet/pcrecomp.git "$PCRECOMP"
+        git clone https://github.com/sp00nznet/pcrecomp.git "$PCRECOMP"
+        git -C "$PCRECOMP" checkout 35548b8d0fd8aa853da67edcf7cd6134f6b9cdc7
     fi
     echo "[INFO] Applying patches from patches/pcrecomp/..."
     for p in "$ROOT"/patches/pcrecomp/*.patch; do
         if [ -f "$p" ]; then
-            git -C "$PCRECOMP" apply "$p" 2>/dev/null || true
+            git -C "$PCRECOMP" apply "$p"
         fi
     done
 fi
@@ -76,8 +77,8 @@ fi
 # 5. Compile flags
 MOJO="$ROOT/third_party/mojoshader"
 MOJODEF="-DSUPPORT_PROFILE_ARB1=0 -DSUPPORT_PROFILE_ARB1_NV=0 -DSUPPORT_PROFILE_HLSL=0 -DSUPPORT_PROFILE_METAL=0 -DSUPPORT_PROFILE_D3D=0 -DSUPPORT_PROFILE_BYTECODE=0 -DSUPPORT_PROFILE_SPIRV=0 -DSUPPORT_PROFILE_GLSPIRV=0 -DMOJOSHADER_DEPTH_CLIPPING -DMOJOSHADER_FLIP_RENDERTARGET"
-GLESINC="-I$ROOT/ports/r36s/d3d9_gles -I$MOJO -I$DXVK -I$DXVK/windows -I$DXVK/directx $SDK_INC"
-APPINC="-I$ROOT/ports/r36s -I$ROOT/ports/r36s/d3d9_gles -I$ROOT/android/app/src/main/cpp -I$ROOT/src/runtime -I$ROOT/src/platform -I$PCRECOMP/runtime/recomp32 -I$PCRECOMP/runtime/win32hle $SDK_INC -isystem $DXVK -isystem $DXVK/windows -isystem $DXVK/directx"
+GLESINC="-I$ROOT/ports/r36s/d3d9_gles -I$MOJO -I$ROOT/build/dxvk-source/include -I$DXVK -I$DXVK/windows -I$DXVK/directx $SDK_INC"
+APPINC="-I$ROOT/ports/r36s -I$ROOT/ports/r36s/d3d9_gles -I$ROOT/android/app/src/main/cpp -I$ROOT/src/runtime -I$ROOT/src/platform -I$PCRECOMP/runtime/recomp32 -I$PCRECOMP/runtime/win32hle $SDK_INC -isystem $ROOT/build/dxvk-source/include -isystem $DXVK -isystem $DXVK/windows -isystem $DXVK/directx"
 APPDEF="-DRECOMP_TLS=__thread -DRECOMP_TLS_STRUCT -DNFS_PARALLEL_GUEST -DNFS_FIXED_GUEST_BASE=0x1000000000ULL -DNFS_R36S -DNFS_GLES -DNFS_D3D9_BACKEND -DNFS_SDL_AUDIO -DRECOMP_STRICT_ICALL -DRECOMP_X87_WINDOW $MOJODEF"
 OPT="-O2 -g0 -DNDEBUG -fno-strict-aliasing -ffp-contract=off"
 

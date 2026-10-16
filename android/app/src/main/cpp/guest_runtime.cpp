@@ -180,10 +180,6 @@ public:
         lock();
         std::lock_guard<std::mutex> l(m_);depth_=depth;
     }
-    bool hasWaiters(){
-        std::lock_guard<std::mutex> lock(m_);
-        return next_>serving_+1; // the current owner already holds one ticket
-    }
     void unlock(){
         {
             std::lock_guard<std::mutex> l(m_);
@@ -476,9 +472,10 @@ void d3dDispatch(){uint32_t args[32];std::memcpy(args,ptr(g_esp+4,48),48);uint32
         }
     }
     if(token==0x7e002110u&&result==0){
-        static FramePacer pacer;
-        auto now=std::chrono::steady_clock::now();
 #if defined(NFS_R36S)
+        static unsigned appliedLimit=0;static auto nextFrame=std::chrono::steady_clock::now();
+        unsigned cap=frameLimit.load(std::memory_order_relaxed);
+        auto now=std::chrono::steady_clock::now();
         if(cap!=appliedLimit){appliedLimit=cap;nextFrame=now;}
         // Next deadline one period after the previous one, but never in the past: a frame that ran late
         // starts the next period now. (It used to reset only after falling 200 ms behind and then sleep a
@@ -486,6 +483,8 @@ void d3dDispatch(){uint32_t args[32];std::memcpy(args,ptr(g_esp+4,48),48);uint32
         if(cap){nextFrame=std::max(nextFrame+std::chrono::nanoseconds(1000000000ull/cap),now);
             if(nextFrame>now){std::this_thread::sleep_until(nextFrame);if(nfsIsGameThread())nfsWaitAdd(9,std::chrono::duration_cast<std::chrono::nanoseconds>(nextFrame-now).count());}}
 #else
+        static FramePacer pacer;
+        auto now=std::chrono::steady_clock::now();
         auto deadline=pacer.deadline(now,frameLimit.load(std::memory_order_relaxed));
         // The renderer has returned; guest audio/streaming workers can use the
         // machine while this thread waits. Late frames incur no extra delay.
