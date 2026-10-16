@@ -29,15 +29,14 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Install ARM64 Cross Toolchain & Multiarch SDL2
+      - name: Install ARM64 Cross Toolchain & SDL2 Headers
         run: |
-          sudo dpkg --add-architecture arm64
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             gcc-aarch64-linux-gnu \
             g++-aarch64-linux-gnu \
             binutils-aarch64-linux-gnu \
-            libsdl2-dev:arm64 \
+            libsdl2-dev \
             python3
 
       - name: Fetch Dependencies (pcrecomp headers & DXVK D3D9 headers)
@@ -68,7 +67,7 @@ jobs:
           DXVK="$ROOT/build/dxvk-source/include/native"
           MOJO="$ROOT/third_party/mojoshader"
           
-          SDL_INC="-I/usr/include/aarch64-linux-gnu -I/usr/include/aarch64-linux-gnu/SDL2 -I/usr/include/SDL2"
+          SDL_INC="-I/usr/include/SDL2"
           MOJODEF="-DSUPPORT_PROFILE_ARB1=0 -DSUPPORT_PROFILE_ARB1_NV=0 -DSUPPORT_PROFILE_HLSL=0 -DSUPPORT_PROFILE_METAL=0 -DSUPPORT_PROFILE_D3D=0 -DSUPPORT_PROFILE_BYTECODE=0 -DSUPPORT_PROFILE_SPIRV=0 -DSUPPORT_PROFILE_GLSPIRV=0 -DMOJOSHADER_DEPTH_CLIPPING -DMOJOSHADER_FLIP_RENDERTARGET"
           GLESINC="-I$ROOT/ports/r36s/d3d9_gles -I$MOJO -I$DXVK -I$DXVK/windows -I$DXVK/directx $SDL_INC"
           APPINC="-I$ROOT/ports/r36s -I$ROOT/ports/r36s/d3d9_gles -I$ROOT/android/app/src/main/cpp -I$ROOT/src/runtime -I$ROOT/src/platform -I$PCRECOMP/runtime/recomp32 -I$PCRECOMP/runtime/win32hle $SDL_INC -isystem $DXVK -isystem $DXVK/windows -isystem $DXVK/directx"

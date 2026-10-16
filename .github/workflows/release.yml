@@ -29,7 +29,7 @@ jobs:
   release:
     name: Build & Publish Release
     # Run only if triggered manually OR if a pull request was merged (not simply closed/rejected)
-    if: github.event_name == 'workflow_dispatch' || (github.event.pull_request.merged == true)
+    if: (github.event_name == 'workflow_dispatch') || (github.event_name == 'pull_request' && github.event.pull_request.merged == true)
     runs-on: ubuntu-22.04
     permissions:
       contents: write
@@ -41,15 +41,14 @@ jobs:
           fetch-depth: 0
           submodules: recursive
 
-      - name: Install ARM64 Cross-Compiler & Multiarch SDL2
+      - name: Install ARM64 Cross-Compiler & SDL2 Headers
         run: |
-          sudo dpkg --add-architecture arm64
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             gcc-aarch64-linux-gnu \
             g++-aarch64-linux-gnu \
             binutils-aarch64-linux-gnu \
-            libsdl2-dev:arm64 \
+            libsdl2-dev \
             zip \
             curl \
             tar \
@@ -116,19 +115,19 @@ jobs:
           cp "$GITHUB_WORKSPACE/ports/r36s/package/README.md" "$STAGE_DIR/nfsu2/"
           cp -r "$GITHUB_WORKSPACE/ports/r36s/package/widescreen" "$STAGE_DIR/nfsu2/"
 
-          cat << 'EOF' > "$STAGE_DIR/nfsu2/gamedata/COPY_RETAIL_PC_FILES_HERE.txt"
-Need for Speed: Underground 2 — PortMaster
-==========================================
-
-Copy your retail PC game files here:
-- SPEED2.EXE
-- GLOBAL/
-- CARS/
-- TRACKS/
-- SOUND/
-- MOVIES/
-- LANGUAGES/
-EOF
+          printf "%s\n" \
+            "Need for Speed: Underground 2 — PortMaster" \
+            "==========================================" \
+            "" \
+            "Copy your retail PC game files here:" \
+            "- SPEED2.EXE" \
+            "- GLOBAL/" \
+            "- CARS/" \
+            "- TRACKS/" \
+            "- SOUND/" \
+            "- MOVIES/" \
+            "- LANGUAGES/" \
+            > "$STAGE_DIR/nfsu2/gamedata/COPY_RETAIL_PC_FILES_HERE.txt"
 
           if [ "$HAVE_GUEST_OBJS" = "true" ] && [ -f "$GITHUB_WORKSPACE/ports/r36s/package/nfsu2.aarch64" ]; then
             cp "$GITHUB_WORKSPACE/ports/r36s/package/nfsu2.aarch64" "$STAGE_DIR/nfsu2/"
@@ -152,7 +151,7 @@ EOF
           if [ -n "${{ github.event.inputs.tag_name }}" ]; then
             TAG="${{ github.event.inputs.tag_name }}"
           elif [ "${{ github.event_name }}" = "pull_request" ]; then
-            PR_NUM="${{ github.event.pull_request.number }}"
+            PR_NUM="${{ github.event.number }}"
             TAG="v1.0.0-r36s-pr${PR_NUM}-${SHORT_SHA}"
           else
             TAG="v1.0.0-r36s-${DATE_TAG}-${SHORT_SHA}"
@@ -161,7 +160,7 @@ EOF
           if [ -n "${{ github.event.inputs.release_title }}" ]; then
             TITLE="${{ github.event.inputs.release_title }}"
           elif [ "${{ github.event_name }}" = "pull_request" ]; then
-            TITLE="NFSU2 R36S Port - PR #${{ github.event.pull_request.number }}: ${{ github.event.pull_request.title }}"
+            TITLE="NFSU2 R36S Port - PR #${{ github.event.number }}"
           else
             TITLE="NFSU2 R36S Release ${TAG}"
           fi
@@ -174,7 +173,7 @@ EOF
         with:
           tag_name: ${{ steps.release_info.outputs.TAG }}
           name: ${{ steps.release_info.outputs.TITLE }}
-          draft: ${{ github.event.inputs.draft || false }}
+          draft: ${{ github.event_name == 'workflow_dispatch' && inputs.draft == true }}
           prerelease: false
           generate_release_notes: true
           files: |

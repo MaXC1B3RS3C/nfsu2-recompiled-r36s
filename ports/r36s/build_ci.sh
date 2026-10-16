@@ -16,7 +16,6 @@ CC="${CC:-${CROSS_COMPILE}gcc}"
 CXX="${CXX:-${CROSS_COMPILE}g++}"
 STRIP="${STRIP:-${CROSS_COMPILE}strip}"
 OBJDUMP="${OBJDUMP:-${CROSS_COMPILE}objdump}"
-JOBS="${JOBS:-$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)}"
 
 echo "============================================================"
 echo " NFSU2 R36S Fast CI/CD Build (ARM64)                        "
@@ -55,17 +54,12 @@ if [ ! -f "$DXVK/windows/d3d9.h" ]; then
     rm -rf "$TMP_DXVK"
 fi
 
-# 3. Locate SDL2 headers & libraries
+# 3. Locate SDL2 headers
 SDL_INC=""
-SDL_LIB=""
-if [ -d "/usr/include/aarch64-linux-gnu/SDL2" ]; then
-    SDL_INC="-I/usr/include/aarch64-linux-gnu -I/usr/include/aarch64-linux-gnu/SDL2"
-elif [ -d "/usr/include/SDL2" ]; then
+if [ -d "/usr/include/SDL2" ]; then
     SDL_INC="-I/usr/include -I/usr/include/SDL2"
-fi
-
-if [ -d "/usr/lib/aarch64-linux-gnu" ]; then
-    SDL_LIB="-L/usr/lib/aarch64-linux-gnu"
+elif [ -d "/usr/include/aarch64-linux-gnu/SDL2" ]; then
+    SDL_INC="-I/usr/include/aarch64-linux-gnu -I/usr/include/aarch64-linux-gnu/SDL2"
 fi
 
 # 4. Verify guest objects
@@ -121,11 +115,17 @@ if [ "$fail" != 0 ]; then
     exit 1
 fi
 
-# 7. Generate GLESv2 stub for clean dynamic linking on RK3326 ArkOS
-STUB="$BUILD_DIR/gles2stub"
+# 7. Generate GLESv2 and SDL2 stubs for clean dynamic linking on RK3326 ArkOS
+STUB="$BUILD_DIR/stubs"
 mkdir -p "$STUB"
-nm -u "$BUILD_DIR"/obj/*.o | awk '{print $2}' | grep -E '^gl[A-Z]' | sort -u | sed 's/.*/void &(void){}/' > "$STUB/stub.c"
-"$CC" -shared -fPIC -o "$STUB/libGLESv2.so" -Wl,-soname,libGLESv2.so.2 "$STUB/stub.c"
+
+# GLES2 stub with soname libGLESv2.so.2
+nm -u "$BUILD_DIR"/obj/*.o | awk '{print $2}' | grep -E '^gl[A-Z]' | sort -u | sed 's/.*/void &(void){}/' > "$STUB/stub_gles.c"
+"$CC" -shared -fPIC -o "$STUB/libGLESv2.so" -Wl,-soname,libGLESv2.so.2 "$STUB/stub_gles.c"
+
+# SDL2 stub with soname libSDL2-2.0.so.0
+nm -u "$BUILD_DIR"/obj/*.o | awk '{print $2}' | grep -E '^SDL_' | sort -u | sed 's/.*/void &(void){}/' > "$STUB/stub_sdl.c"
+"$CC" -shared -fPIC -o "$STUB/libSDL2.so" -Wl,-soname,libSDL2-2.0.so.0 "$STUB/stub_sdl.c"
 
 # 8. Link final binary
 echo "  LD $OUT/nfsu2.aarch64"
@@ -133,7 +133,6 @@ echo "  LD $OUT/nfsu2.aarch64"
     "$BUILD_DIR"/obj/*.o \
     "$GUEST_DIR"/*.o \
     -L"$STUB" \
-    $SDL_LIB \
     -lSDL2 -lGLESv2 -lpthread -ldl -lm -rdynamic -no-pie
 
 # 9. Strip and verify
