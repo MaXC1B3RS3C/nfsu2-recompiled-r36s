@@ -1,5 +1,32 @@
-# Need for Speed Underground 2 — Recompiled
+# Need for Speed Underground 2 — R36S & PortMaster ARM64 Port
 
+[![Platform](https://img.shields.io/badge/Platform-R36S%20%7C%20ArkOS%20%7C%20PortMaster-blue.svg)](docs/R36S_PORT.md)
+[![Architecture](https://img.shields.io/badge/Arch-Linux%20aarch64%20(RK3326)-orange.svg)](docs/R36S_PORT.md)
+[![Graphics](https://img.shields.io/badge/Graphics-OpenGL%20ES%202.0%20(Mali--G31)-green.svg)](docs/R36S_PORT.md)
+[![CI/CD](https://github.com/manuelpllull/nfsu2-recompiled-r36s/actions/workflows/ci.yml/badge.svg)](https://github.com/manuelpllull/nfsu2-recompiled-r36s/actions/workflows/ci.yml)
+[![Releases](https://img.shields.io/github/v/release/manuelpllull/nfsu2-recompiled-r36s?include_prereleases&label=Latest%20Release)](https://github.com/manuelpllull/nfsu2-recompiled-r36s/releases)
+
+A native, high-performance static recompilation of **Need for Speed: Underground 2** for the **R36S** and compatible RK3326 Linux handheld consoles running ArkOS, AmberELEC, or ROCKNIX via **PortMaster**.
+
+> [!TIP]
+> **Quick Start**:
+> 1. Download the latest [`NFSU2-R36S.zip`](https://github.com/manuelpllull/nfsu2-recompiled-r36s/releases) release package.
+> 2. Extract into `roms/ports/` on your SD card.
+> 3. Copy your PC game files into `roms/ports/nfsu2/gamedata/` (must contain `GLOBAL/`, `CARS/`, `TRACKS/`, etc.).
+> 4. Launch **Need for Speed Underground 2** from the **Ports** menu!
+> 
+> Detailed architecture, controller maps, and benchmark reports: [**R36S Port Guide**](docs/R36S_PORT.md).
+
+### 🎮 R36S Port Highlights
+* **Native 640×480 Display**: Pixel-perfect 4:3 native rendering for the R36S IPS panel without black bars or stretched HUD.
+* **Custom D3D9 → OpenGL ES 2.0 Translation Layer**: Optimized for the ARM Mali-G31 GPU with MojoShader bytecode translation.
+* **Multithreaded Render Thread**: Decoupled guest engine thread and dedicated render thread with redundant state filtering.
+* **Cortex-A35 Math Optimizations**: Native replacements for `ftol2`, matrix transforms, and distance culling for smooth framerates on in-order RK3326 cores.
+* **PortMaster Gamepad Integration**: Preconfigured GPTK controls with analog steering, D-Pad navigation, and shortcut hotkeys.
+
+---
+
+## Upstream Project (Android & Windows)
 
 ### Android downloads / Descargas Android
 
