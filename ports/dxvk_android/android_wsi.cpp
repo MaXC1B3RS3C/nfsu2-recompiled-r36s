@@ -32,7 +32,10 @@ HMONITOR monitor(){return reinterpret_cast<HMONITOR>(uintptr_t{1});}
 // The Vulkan driver DXVK talks to: the linked system loader, or an imported
 // adrenotools driver chosen in the launcher (set before the device exists).
 std::atomic<PFN_vkGetInstanceProcAddr> instanceProcAddr{nullptr};
+typedef VkResult (*DxvkCustomSurfaceCreatorFn)(VkInstance instance, VkSurfaceKHR* surface);
+std::atomic<DxvkCustomSurfaceCreatorFn> customSurfaceCreator{nullptr};
 }
+extern "C" void dxvkSetCustomSurfaceCreator(DxvkCustomSurfaceCreatorFn entry){customSurfaceCreator=entry;}
 extern "C" void dxvkAndroidSetInstanceProcAddr(PFN_vkGetInstanceProcAddr entry){instanceProcAddr=entry;}
 extern "C" PFN_vkGetInstanceProcAddr dxvkAndroidGetInstanceProcAddr(){
     auto entry=instanceProcAddr.load();return entry?entry:vkGetInstanceProcAddr;
@@ -70,6 +73,10 @@ names.add(VK_KHR_ANDROID_SURFACE_EXTENSION_NAME);
 #else
 names.add(VK_KHR_XLIB_SURFACE_EXTENSION_NAME);
 #endif
+#if defined(NFS_R36S) || defined(DXVK_WSI_SDL)
+names.add("VK_KHR_wayland_surface");
+names.add("VK_KHR_display");
+#endif
 return names;}
 DxvkNameSet DxvkPlatformExts::getDeviceExtensions(uint32_t){return {};}
 void DxvkPlatformExts::initInstanceExtensions(){}
@@ -78,6 +85,8 @@ void DxvkPlatformExts::initDeviceExtensions(const DxvkInstance*){}
 namespace dxvk::wsi {
 VkResult createSurface(HWND window,const Rc<vk::InstanceFn>& instance,VkSurfaceKHR* surface){
     std::lock_guard<std::mutex> guard(windowMutex);
+    auto custom=customSurfaceCreator.load();
+    if(custom)return custom(instance->instance(),surface);
     if(!currentWindow||window!=currentHandle)return VK_ERROR_SURFACE_LOST_KHR;
 #ifdef __ANDROID__
     auto create=reinterpret_cast<PFN_vkCreateAndroidSurfaceKHR>(dxvkAndroidGetInstanceProcAddr()(instance->instance(),"vkCreateAndroidSurfaceKHR"));

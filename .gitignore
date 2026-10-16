@@ -28,3 +28,15 @@ work/
 *.i64
 *.gzf
 *.dxvk-cache
+
+# OS and temporary files
+.DS_Store
+test_dxso_files.sh
+HANDOVER_FOR_OPENCODE.md
+third_party/SPIRV-Cross/
+
+# Distribution packages and binaries
+dist/
+*.aarch64
+
+

@@ -42,7 +42,10 @@ void createFile(){
 }
 void readFile(){
     auto file=fileHandles.find(arg(0));if(file==fileHandles.end()){lastError=6;ret(0,5);return;}if(arg(4))throw GuestStop("Overlapped ReadFile pending");
-    if(arg(3))write32(arg(3),0);ssize_t count;do{count=::read(file->second,ptr(arg(1),arg(2)),arg(2));}while(count<0&&errno==EINTR);
+    if(arg(3))write32(arg(3),0);ssize_t count;
+    const auto readStart=std::chrono::steady_clock::now();
+    do{count=::read(file->second,ptr(arg(1),arg(2)),arg(2));}while(count<0&&errno==EINTR);
+    if(nfsIsGameThread()){nfsWaitAdd(10,std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-readStart).count());if(count>0)nfsWaitAdd(11,uint64_t(count));}
     if(count<0){lastError=fileError();ret(0,5);return;}if(arg(3))write32(arg(3),count);ret(1,5);
 }
 void writeFile(){
