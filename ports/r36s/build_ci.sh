@@ -89,34 +89,36 @@ fi
 
 compile() {
     local src="$1" obj="$2"; shift 2
-    echo "  CC $(basename "$src")"
-    "$@" -c "$src" -o "$obj"
+    local name="$(basename "$src")"
+    echo "  CC $name"
+    local err_file="$BUILD_DIR/obj/${name}.err"
+    if ! "$@" -c "$src" -o "$obj" 2> "$err_file"; then
+        echo "[ERROR] Compilation failed for $name:" >&2
+        cat "$err_file" >&2
+        if [ -n "$GITHUB_STEP_SUMMARY" ]; then
+            echo "### ❌ Compilation Failure: \`$name\`" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            cat "$err_file" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+        fi
+        return 1
+    fi
 }
 
-# 6. Parallel compilation of runtime and translation layer
-pids=()
-compile "$ROOT/ports/r36s/d3d9_gles/d3d9_gles.cpp" "$BUILD_DIR/obj/d3d9_gles.o" "$CXX" -std=c++17 $OPT $MOJODEF -DNFS_R36S -DNFS_GLES $GLESINC & pids+=($!)
+# 6. Compilation of runtime and translation layer
+compile "$ROOT/ports/r36s/d3d9_gles/d3d9_gles.cpp" "$BUILD_DIR/obj/d3d9_gles.o" "$CXX" -std=c++17 $OPT $MOJODEF -DNFS_R36S -DNFS_GLES $GLESINC
 for c in mojoshader.c mojoshader_common.c profiles/mojoshader_profile_common.c profiles/mojoshader_profile_glsl.c; do
-    compile "$MOJO/$c" "$BUILD_DIR/obj/$(basename "$c" .c).o" "$CC" $OPT $MOJODEF -DNFS_R36S -DNFS_GLES -I"$MOJO" & pids+=($!)
+    compile "$MOJO/$c" "$BUILD_DIR/obj/$(basename "$c" .c).o" "$CC" $OPT $MOJODEF -DNFS_R36S -DNFS_GLES -I"$MOJO"
 done
-compile "$ROOT/ports/r36s/main.cpp" "$BUILD_DIR/obj/main.o" "$CXX" -std=c++17 $OPT $APPDEF $APPINC & pids+=($!)
-compile "$ROOT/android/app/src/main/cpp/guest_runtime.cpp" "$BUILD_DIR/obj/guest_runtime.o" "$CXX" -std=c++17 $OPT $APPDEF $APPINC & pids+=($!)
-compile "$ROOT/android/app/src/main/cpp/d3d9_bridge.cpp" "$BUILD_DIR/obj/d3d9_bridge.o" "$CXX" -std=c++17 $OPT $APPDEF $APPINC & pids+=($!)
-compile "$ROOT/src/runtime/overrides.c" "$BUILD_DIR/obj/overrides.o" "$CC" $OPT $APPDEF $APPINC & pids+=($!)
-compile "$ROOT/src/runtime/fx_cache.c" "$BUILD_DIR/obj/fx_cache.o" "$CC" $OPT $APPDEF $APPINC & pids+=($!)
-compile "$ROOT/src/runtime/hud_half.c" "$BUILD_DIR/obj/hud_half.o" "$CC" $OPT $APPDEF $APPINC & pids+=($!)
-compile "$ROOT/src/runtime/world_cull.c" "$BUILD_DIR/obj/world_cull.o" "$CC" $OPT $APPDEF $APPINC & pids+=($!)
-compile "$ROOT/src/runtime/native_math.c" "$BUILD_DIR/obj/native_math.o" "$CC" $OPT $APPDEF $APPINC & pids+=($!)
-compile "$ROOT/src/runtime/widescreen.c" "$BUILD_DIR/obj/widescreen.o" "$CC" $OPT $APPDEF $APPINC & pids+=($!)
-
-fail=0
-for p in "${pids[@]}"; do
-    wait "$p" || fail=1
-done
-if [ "$fail" != 0 ]; then
-    echo "[ERROR] Host compilation failed!"
-    exit 1
-fi
+compile "$ROOT/ports/r36s/main.cpp" "$BUILD_DIR/obj/main.o" "$CXX" -std=c++17 $OPT $APPDEF $APPINC
+compile "$ROOT/android/app/src/main/cpp/guest_runtime.cpp" "$BUILD_DIR/obj/guest_runtime.o" "$CXX" -std=c++17 $OPT $APPDEF $APPINC
+compile "$ROOT/android/app/src/main/cpp/d3d9_bridge.cpp" "$BUILD_DIR/obj/d3d9_bridge.o" "$CXX" -std=c++17 $OPT $APPDEF $APPINC
+compile "$ROOT/src/runtime/overrides.c" "$BUILD_DIR/obj/overrides.o" "$CC" $OPT $APPDEF $APPINC
+compile "$ROOT/src/runtime/fx_cache.c" "$BUILD_DIR/obj/fx_cache.o" "$CC" $OPT $APPDEF $APPINC
+compile "$ROOT/src/runtime/hud_half.c" "$BUILD_DIR/obj/hud_half.o" "$CC" $OPT $APPDEF $APPINC
+compile "$ROOT/src/runtime/world_cull.c" "$BUILD_DIR/obj/world_cull.o" "$CC" $OPT $APPDEF $APPINC
+compile "$ROOT/src/runtime/native_math.c" "$BUILD_DIR/obj/native_math.o" "$CC" $OPT $APPDEF $APPINC
+compile "$ROOT/src/runtime/widescreen.c" "$BUILD_DIR/obj/widescreen.o" "$CC" $OPT $APPDEF $APPINC
 
 if [ "$COMPILE_ONLY" = "1" ]; then
     echo "============================================================"
