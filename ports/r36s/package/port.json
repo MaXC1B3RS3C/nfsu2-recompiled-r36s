@@ -1,0 +1,27 @@
+{
+  "version": 2,
+  "name": "nfsu2.zip",
+  "items": [
+    "NFSU2.sh",
+    "nfsu2/"
+  ],
+  "items_opt": [],
+  "attr": {
+    "title": "Need for Speed: Underground 2",
+    "desc": "Native static binary recompilation of Need for Speed: Underground 2 (SPEED2.EXE) for Rockchip RK3326 and ARM64 Linux handhelds.",
+    "inst": "Copy your retail PC Need for Speed Underground 2 installation files into the ports/nfsu2/gamedata/ folder on your SD card. Required: SPEED2.EXE, GLOBAL, CARS, TRACKS, SOUND, MOVIES.",
+    "genres": [
+      "Racing",
+      "Action"
+    ],
+    "portver": "1.0.0",
+    "runtimes": [],
+    "reqs": [
+      "640x480",
+      "1GB RAM"
+    ],
+    "arch": [
+      "aarch64"
+    ]
+  }
+}

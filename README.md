@@ -201,6 +201,26 @@ See additional documentation:
 
 ---
 
+## R36S Handheld & PortMaster Port
+
+The `ports/r36s/` directory contains the complete build and packaging setup for the **R36S** and compatible ARM64 handheld consoles (Rockchip RK3326) running ArkOS, AmberELEC, or ROCKNIX via PortMaster:
+
+1. **Building the Binary**:
+   ```bash
+   bash ports/r36s/build_r36s.sh
+   ```
+2. **Device Deployment**:
+   - Copy `ports/r36s/package/NFSU2.sh` to `/roms/ports/` on your SD card.
+   - Copy the folder `ports/r36s/package/` into `/roms/ports/nfsu2/`.
+   - Copy your retail PC game files into `/roms/ports/nfsu2/gamedata/`.
+   - Launch **Need for Speed Underground 2** from your device's Ports menu!
+
+See additional documentation:
+- [R36S Port Architecture & Technical Guide](docs/R36S_PORT.md)
+- [PortMaster Package & Controls Setup](ports/r36s/package/README.md)
+
+---
+
 ## Patches Applied to pcrecomp
 
 The project uses tailored patches over upstream pcrecomp located in `patches/pcrecomp/`:

@@ -1,0 +1,95 @@
+# Need for Speed: Underground 2 — R36S & PortMaster Installation Guide
+
+This port runs a native static binary recompilation of **Need for Speed: Underground 2** on the **R36S** handheld console (Rockchip RK3326 SoC) and compatible ARM64 handhelds running ArkOS, AmberELEC, or ROCKNIX.
+
+---
+
+## 📁 Installation Directory Structure
+
+Copy the files to your SD card (either `TF1` or `TF2/EASYROMS`) under the `ports/` directory:
+
+```text
+/roms/ports/
+├── NFSU2.sh                        <- Launcher script
+└── nfsu2/                          <- Game folder
+    ├── nfsu2.aarch64               <- Native ARM64 binary executable
+    ├── port.json                   <- PortMaster metadata
+    ├── nfsu2.gptk                  <- Gamepad mapping profile
+    ├── libs/                       <- Bundled runtime libraries (libSDL2, etc.)
+    ├── widescreen/                 <- HUD layout for wide screens (ThirteenAG's widescreen fix, MIT)
+    └── gamedata/                   <- YOUR PC GAME FILES GO HERE
+        ├── SPEED2.EXE              <- Unpacked PC executable
+        ├── GLOBAL/                 <- Global assets (GLOBALB.BUN, etc.)
+        ├── CARS/                   <- Car models, textures, vinyls
+        ├── TRACKS/                 <- City tracks and collision data
+        ├── SOUND/                  <- Music and SFX bank files
+        ├── MOVIES/                 <- Intro & FMV video cutscenes
+        ├── LANGUAGES/              <- Language files (Spanish, English, etc.)
+        └── ...
+```
+
+> [!IMPORTANT]
+> **No copyrighted game assets are bundled.** You must provide your own legitimate retail PC copy of Need for Speed: Underground 2.
+
+---
+
+## 🎮 Controller Layout (R36S)
+
+Button names are the labels printed on the R36S. The layout follows the PS2 version (Cross = bottom button).
+
+| R36S Button | Driving / Free Roam | Menus |
+|:---|:---|:---|
+| **Left Stick** | Steer (analog) | Navigate |
+| **D-Pad Up** | Enter shop / engage event / challenge | Navigate |
+| **D-Pad Down** | Career status | Navigate |
+| **D-Pad Left** | World map | Navigate |
+| **D-Pad Right** | SMS messages | Navigate |
+| **B** (bottom) | Accelerate | Select / Confirm |
+| **Y** (left) | Brake / Reverse | Space |
+| **A** (right) | Handbrake (E-Brake) | Back |
+| **X** (top) | Change camera | Back |
+| **R1** | Nitrous | — |
+| **L1** | Look behind | — |
+| **R2 / L2** | Shift up / Shift down (manual gearbox) | — |
+| **Start** | Pause | Select / Confirm |
+| **Select** | Reset car | — |
+| **Select + Start** | **Quit to the system menu** | **Quit to the system menu** |
+| **Select + R3** | Show/hide the frame counter | Show/hide the frame counter |
+
+---
+
+## ⚡ Technical Specifications & Performance
+
+- **Resolution**: the handheld's own screen, detected at start. On the R36S that is 640×480, drawn
+  straight to the panel as before. Screens wider than 4:3 (854×480, 960×544, 1280×720 …) get real
+  widescreen: a wider field of view (nothing stretched), the HUD at the screen edges, and a correct
+  mirror, radar and videos, ported from ThirteenAG's NFSU2 widescreen fix. Screens narrower than 4:3
+  (e.g. 720×720) show the full 4:3 picture with black bars. Portrait-mounted panels are turned to
+  landscape.
+- **Display options** (in `ports/nfsu2/nfsu2.cfg`, all optional):
+
+  | Setting | Effect |
+  |---|---|
+  | `NFSU2_ASPECT=4:3` | Always 4:3, with bars on wide screens |
+  | `NFSU2_RENDER_SCALE=0.75` | Render below the panel resolution and scale up (faster on big screens) |
+  | `NFSU2_RENDER=854x480` | Exact render size |
+  | `NFSU2_SCREEN=854x480` | Panel size, only if it is detected wrongly |
+  | `NFSU2_ROTATE=90` or `270` | Panel mounted rotated (portrait panels default to 90) |
+
+  More pixels cost GPU time. On a weak GPU with a big screen, start with `NFSU2_RENDER_SCALE=0.75`.
+- **GPU-only extras** (`NFSU2_GPU_EXTRAS=1` in `nfsu2.cfg`): trilinear texture filtering, the game's colour
+  tinting and detailed car models on top of the chosen profile. They add no draw calls and no CPU work; whether
+  the GPU has room for them is what the `[NFSU2 GPU]` lines in `log.txt` show. `NFSU2_GPU_EXTRAS=ab` alternates
+  off/on at each launch for a comparison (`log.prev.txt` keeps the previous session).
+- **Target FPS**: 30–60 FPS with CPU performance governor enabled in `NFSU2.sh`.
+- **Audio Engine**: SDL2 PCM stereo float mixer with low latency.
+- **Memory**: Runs comfortably within the 1 GB DDR3L RAM boundary of RK3326.
+- **Save Games**: Automatically saved in `gamedata/AppData/Local/` or profile directory.
+
+---
+
+## 🛠️ Troubleshooting
+
+- **Black screen on launch**: Verify that `SPEED2.EXE` is present inside `gamedata/`. Check `ports/nfsu2/log.txt` for details.
+- **Controls not responding**: Ensure `gamecontrollerdb.txt` exists in PortMaster, or verify controller configuration in EmulationStation.
+- **Audio stutter**: Ensure CPU governor is set to `performance` in the launch script.
