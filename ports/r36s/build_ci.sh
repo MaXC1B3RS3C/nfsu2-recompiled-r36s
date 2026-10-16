@@ -10,6 +10,7 @@ PCRECOMP="${PCRECOMP:-$ROOT/../pcrecomp}"
 BUILD_DIR="${BUILD_DIR:-$ROOT/build/ci-r36s}"
 OUT="${OUT:-$ROOT/ports/r36s/package}"
 GUEST_DIR="${GUEST_DIR:-$BUILD_DIR/guest-objs}"
+COMPILE_ONLY="${COMPILE_ONLY:-0}"
 
 CROSS_COMPILE="${CROSS_COMPILE:-aarch64-linux-gnu-}"
 CC="${CC:-${CROSS_COMPILE}gcc}"
@@ -19,10 +20,11 @@ OBJDUMP="${OBJDUMP:-${CROSS_COMPILE}objdump}"
 
 echo "============================================================"
 echo " NFSU2 R36S Fast CI/CD Build (ARM64)                        "
-echo " Compiler : $CC / $CXX"
-echo " Build Dir: $BUILD_DIR"
-echo " Output   : $OUT/nfsu2.aarch64"
-echo " Guest Dir: $GUEST_DIR"
+echo " Compiler     : $CC / $CXX"
+echo " Build Dir    : $BUILD_DIR"
+echo " Output       : $OUT/nfsu2.aarch64"
+echo " Guest Dir    : $GUEST_DIR"
+echo " Compile Only : $COMPILE_ONLY"
 echo "============================================================"
 
 mkdir -p "$BUILD_DIR/obj" "$OUT"
@@ -54,28 +56,28 @@ if [ ! -f "$DXVK/windows/d3d9.h" ]; then
     rm -rf "$TMP_DXVK"
 fi
 
-# 3. Locate SDL2 headers
-SDL_INC=""
-if [ -d "/usr/include/SDL2" ]; then
-    SDL_INC="-I/usr/include -I/usr/include/SDL2"
-elif [ -d "/usr/include/aarch64-linux-gnu/SDL2" ]; then
-    SDL_INC="-I/usr/include/aarch64-linux-gnu -I/usr/include/aarch64-linux-gnu/SDL2"
+# 3. Locate SDL2 & GLES2 headers (use bundled SDK headers for exact reproduction)
+SDK_INC="-I$ROOT/ports/r36s/sdk/include -I$ROOT/ports/r36s/sdk/include/SDL2"
+if [ ! -d "$ROOT/ports/r36s/sdk/include/SDL2" ] && [ -d "/usr/include/SDL2" ]; then
+    SDK_INC="-I/usr/include -I/usr/include/SDL2"
 fi
 
-# 4. Verify guest objects
-if [ ! -d "$GUEST_DIR" ] || [ -z "$(find "$GUEST_DIR" -name '*.o' 2>/dev/null | head -1)" ]; then
-    echo "[ERROR] No compiled guest objects (*.o) found in $GUEST_DIR!"
-    echo "Provide precompiled guest objects or extract r36s-guest-objs.tar.gz into $GUEST_DIR."
-    exit 1
+# 4. Verify guest objects (only if linking)
+if [ "$COMPILE_ONLY" != "1" ]; then
+    if [ ! -d "$GUEST_DIR" ] || [ -z "$(find "$GUEST_DIR" -name '*.o' 2>/dev/null | head -1)" ]; then
+        echo "[ERROR] No compiled guest objects (*.o) found in $GUEST_DIR!"
+        echo "Provide precompiled guest objects or extract r36s-guest-objs.tar.gz into $GUEST_DIR."
+        exit 1
+    fi
+    GUEST_OBJ_COUNT="$(find "$GUEST_DIR" -name '*.o' | wc -l | tr -d ' ')"
+    echo "[INFO] Found $GUEST_OBJ_COUNT precompiled guest objects in $GUEST_DIR."
 fi
-GUEST_OBJ_COUNT="$(find "$GUEST_DIR" -name '*.o' | wc -l | tr -d ' ')"
-echo "[INFO] Found $GUEST_OBJ_COUNT precompiled guest objects in $GUEST_DIR."
 
 # 5. Compile flags
 MOJO="$ROOT/third_party/mojoshader"
 MOJODEF="-DSUPPORT_PROFILE_ARB1=0 -DSUPPORT_PROFILE_ARB1_NV=0 -DSUPPORT_PROFILE_HLSL=0 -DSUPPORT_PROFILE_METAL=0 -DSUPPORT_PROFILE_D3D=0 -DSUPPORT_PROFILE_BYTECODE=0 -DSUPPORT_PROFILE_SPIRV=0 -DSUPPORT_PROFILE_GLSPIRV=0 -DMOJOSHADER_DEPTH_CLIPPING -DMOJOSHADER_FLIP_RENDERTARGET"
-GLESINC="-I$ROOT/ports/r36s/d3d9_gles -I$MOJO -I$DXVK -I$DXVK/windows -I$DXVK/directx $SDL_INC"
-APPINC="-I$ROOT/ports/r36s -I$ROOT/ports/r36s/d3d9_gles -I$ROOT/android/app/src/main/cpp -I$ROOT/src/runtime -I$ROOT/src/platform -I$PCRECOMP/runtime/recomp32 -I$PCRECOMP/runtime/win32hle $SDL_INC -isystem $DXVK -isystem $DXVK/windows -isystem $DXVK/directx"
+GLESINC="-I$ROOT/ports/r36s/d3d9_gles -I$MOJO -I$DXVK -I$DXVK/windows -I$DXVK/directx $SDK_INC"
+APPINC="-I$ROOT/ports/r36s -I$ROOT/ports/r36s/d3d9_gles -I$ROOT/android/app/src/main/cpp -I$ROOT/src/runtime -I$ROOT/src/platform -I$PCRECOMP/runtime/recomp32 -I$PCRECOMP/runtime/win32hle $SDK_INC -isystem $DXVK -isystem $DXVK/windows -isystem $DXVK/directx"
 APPDEF="-DRECOMP_TLS=__thread -DRECOMP_TLS_STRUCT -DNFS_PARALLEL_GUEST -DNFS_FIXED_GUEST_BASE=0x1000000000ULL -DNFS_R36S -DNFS_GLES -DNFS_D3D9_BACKEND -DNFS_SDL_AUDIO -DRECOMP_STRICT_ICALL -DRECOMP_X87_WINDOW $MOJODEF"
 OPT="-O2 -g0 -DNDEBUG -fno-strict-aliasing -ffp-contract=off"
 
@@ -113,6 +115,13 @@ done
 if [ "$fail" != 0 ]; then
     echo "[ERROR] Host compilation failed!"
     exit 1
+fi
+
+if [ "$COMPILE_ONLY" = "1" ]; then
+    echo "============================================================"
+    echo " COMPILE_ONLY: All runtime objects compiled successfully!   "
+    echo "============================================================"
+    exit 0
 fi
 
 # 7. Generate GLESv2 and SDL2 stubs for clean dynamic linking on RK3326 ArkOS
