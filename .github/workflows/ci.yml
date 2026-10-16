@@ -1,0 +1,99 @@
+name: CI Build Check
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+    paths:
+      - 'ports/**'
+      - 'src/**'
+      - 'third_party/**'
+      - 'android/app/src/main/cpp/**'
+      - '.github/workflows/**'
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-check:
+    name: Compile R36S Translation Layer & Runtime
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install ARM64 Cross Toolchain & Multiarch SDL2
+        run: |
+          sudo dpkg --add-architecture arm64
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc-aarch64-linux-gnu \
+            g++-aarch64-linux-gnu \
+            binutils-aarch64-linux-gnu \
+            libsdl2-dev:arm64 \
+            python3
+
+      - name: Fetch Dependencies (pcrecomp headers & DXVK D3D9 headers)
+        run: |
+          # 1. pcrecomp
+          if [ ! -d "../pcrecomp" ]; then
+            git clone --depth 1 https://github.com/sp00nznet/pcrecomp.git ../pcrecomp
+            for p in patches/pcrecomp/*.patch; do
+              [ -f "$p" ] && git -C ../pcrecomp apply "$GITHUB_WORKSPACE/$p" 2>/dev/null || true
+            done
+          fi
+
+          # 2. DXVK native headers
+          if [ ! -d "build/dxvk-source" ]; then
+            mkdir -p build
+            git clone --depth 1 --branch native-1.9.2b https://github.com/Joshua-Ashton/dxvk-native.git build/dxvk-native-tmp
+            python3 ports/dxvk_android/prepare.py build/dxvk-native-tmp build/dxvk-source
+            rm -rf build/dxvk-native-tmp
+          fi
+
+      - name: Compile Translation Runtime & Engine Overrides
+        run: |
+          mkdir -p build/ci-check/obj
+          
+          ROOT="$GITHUB_WORKSPACE"
+          BUILD_DIR="$ROOT/build/ci-check"
+          PCRECOMP="$ROOT/../pcrecomp"
+          DXVK="$ROOT/build/dxvk-source/include/native"
+          MOJO="$ROOT/third_party/mojoshader"
+          
+          SDL_INC="-I/usr/include/aarch64-linux-gnu -I/usr/include/aarch64-linux-gnu/SDL2 -I/usr/include/SDL2"
+          MOJODEF="-DSUPPORT_PROFILE_ARB1=0 -DSUPPORT_PROFILE_ARB1_NV=0 -DSUPPORT_PROFILE_HLSL=0 -DSUPPORT_PROFILE_METAL=0 -DSUPPORT_PROFILE_D3D=0 -DSUPPORT_PROFILE_BYTECODE=0 -DSUPPORT_PROFILE_SPIRV=0 -DSUPPORT_PROFILE_GLSPIRV=0 -DMOJOSHADER_DEPTH_CLIPPING -DMOJOSHADER_FLIP_RENDERTARGET"
+          GLESINC="-I$ROOT/ports/r36s/d3d9_gles -I$MOJO -I$DXVK -I$DXVK/windows -I$DXVK/directx $SDL_INC"
+          APPINC="-I$ROOT/ports/r36s -I$ROOT/ports/r36s/d3d9_gles -I$ROOT/android/app/src/main/cpp -I$ROOT/src/runtime -I$ROOT/src/platform -I$PCRECOMP/runtime/recomp32 -I$PCRECOMP/runtime/win32hle $SDL_INC -isystem $DXVK -isystem $DXVK/windows -isystem $DXVK/directx"
+          APPDEF="-DRECOMP_TLS=__thread -DRECOMP_TLS_STRUCT -DNFS_PARALLEL_GUEST -DNFS_FIXED_GUEST_BASE=0x1000000000ULL -DNFS_R36S -DNFS_GLES -DNFS_D3D9_BACKEND -DNFS_SDL_AUDIO -DRECOMP_STRICT_ICALL -DRECOMP_X87_WINDOW $MOJODEF"
+          OPT="-O2 -mcpu=cortex-a35 -mtune=cortex-a35 -g0 -DNDEBUG -fno-strict-aliasing -ffp-contract=off"
+
+          echo "[INFO] Compiling translation layer..."
+          aarch64-linux-gnu-g++ -std=c++17 $OPT $MOJODEF -DNFS_R36S -DNFS_GLES $GLESINC -c "$ROOT/ports/r36s/d3d9_gles/d3d9_gles.cpp" -o "$BUILD_DIR/obj/d3d9_gles.o"
+          
+          echo "[INFO] Compiling MojoShader..."
+          for c in mojoshader.c mojoshader_common.c profiles/mojoshader_profile_common.c profiles/mojoshader_profile_glsl.c; do
+            aarch64-linux-gnu-gcc $OPT $MOJODEF -DNFS_R36S -DNFS_GLES -I"$MOJO" -c "$MOJO/$c" -o "$BUILD_DIR/obj/$(basename "$c" .c).o"
+          done
+
+          echo "[INFO] Compiling platform main and guest bridge..."
+          aarch64-linux-gnu-g++ -std=c++17 $OPT $APPDEF $APPINC -c "$ROOT/ports/r36s/main.cpp" -o "$BUILD_DIR/obj/main.o"
+          aarch64-linux-gnu-g++ -std=c++17 $OPT $APPDEF $APPINC -c "$ROOT/android/app/src/main/cpp/guest_runtime.cpp" -o "$BUILD_DIR/obj/guest_runtime.o"
+          aarch64-linux-gnu-g++ -std=c++17 $OPT $APPDEF $APPINC -c "$ROOT/android/app/src/main/cpp/d3d9_bridge.cpp" -o "$BUILD_DIR/obj/d3d9_bridge.o"
+
+          echo "[INFO] Compiling engine overrides and native math..."
+          aarch64-linux-gnu-gcc $OPT $APPDEF $APPINC -c "$ROOT/src/runtime/overrides.c" -o "$BUILD_DIR/obj/overrides.o"
+          aarch64-linux-gnu-gcc $OPT $APPDEF $APPINC -c "$ROOT/src/runtime/fx_cache.c" -o "$BUILD_DIR/obj/fx_cache.o"
+          aarch64-linux-gnu-gcc $OPT $APPDEF $APPINC -c "$ROOT/src/runtime/hud_half.c" -o "$BUILD_DIR/obj/hud_half.o"
+          aarch64-linux-gnu-gcc $OPT $APPDEF $APPINC -c "$ROOT/src/runtime/world_cull.c" -o "$BUILD_DIR/obj/world_cull.o"
+          aarch64-linux-gnu-gcc $OPT $APPDEF $APPINC -c "$ROOT/src/runtime/native_math.c" -o "$BUILD_DIR/obj/native_math.o"
+          aarch64-linux-gnu-gcc $OPT $APPDEF $APPINC -c "$ROOT/src/runtime/widescreen.c" -o "$BUILD_DIR/obj/widescreen.o"
+
+          echo "[SUCCESS] All translation and runtime objects compiled cleanly for Cortex-A35 ARM64!"

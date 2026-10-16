@@ -1,0 +1,194 @@
+name: Build & Release R36S Port
+
+on:
+  pull_request:
+    types: [closed]
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Release Tag (leave empty for auto tag)'
+        required: false
+        default: ''
+      release_title:
+        description: 'Release Title'
+        required: false
+        default: ''
+      draft:
+        description: 'Create as Draft Release'
+        type: boolean
+        required: false
+        default: false
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build & Publish Release
+    # Run only if triggered manually OR if a pull request was merged (not simply closed/rejected)
+    if: github.event_name == 'workflow_dispatch' || (github.event.pull_request.merged == true)
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Install ARM64 Cross-Compiler & Multiarch SDL2
+        run: |
+          sudo dpkg --add-architecture arm64
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc-aarch64-linux-gnu \
+            g++-aarch64-linux-gnu \
+            binutils-aarch64-linux-gnu \
+            libsdl2-dev:arm64 \
+            zip \
+            curl \
+            tar \
+            python3
+
+      - name: Retrieve Precompiled Guest Objects
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p build/guest-objs
+          OBJS_FOUND=false
+
+          # 1. Check if user configured a direct URL secret
+          if [ -n "${{ secrets.GUEST_OBJS_URL }}" ]; then
+            echo "[INFO] Downloading guest objects from GUEST_OBJS_URL secret..."
+            if curl -fSL "${{ secrets.GUEST_OBJS_URL }}" -o guest-objs.tar.gz; then
+              OBJS_FOUND=true
+            fi
+          fi
+
+          # 2. Check if a base assets release exists on the repository
+          if [ "$OBJS_FOUND" = "false" ]; then
+            echo "[INFO] Checking for r36s-guest-objs.tar.gz in repository releases..."
+            if gh release download r36s-base-assets -p "r36s-guest-objs.tar.gz" --repo "${{ github.repository }}" 2>/dev/null; then
+              mv r36s-guest-objs.tar.gz guest-objs.tar.gz
+              OBJS_FOUND=true
+            elif curl -fsSL "https://github.com/${{ github.repository }}/releases/download/r36s-base-assets/r36s-guest-objs.tar.gz" -o guest-objs.tar.gz; then
+              OBJS_FOUND=true
+            fi
+          fi
+
+          # 3. Extract or flag
+          if [ "$OBJS_FOUND" = "true" ] && [ -f guest-objs.tar.gz ]; then
+            tar -xzf guest-objs.tar.gz -C build/guest-objs
+            COUNT=$(find build/guest-objs -name '*.o' | wc -l | tr -d ' ')
+            echo "[SUCCESS] Extracted $COUNT precompiled guest objects."
+            echo "HAVE_GUEST_OBJS=true" >> $GITHUB_ENV
+          else
+            echo "[WARNING] Precompiled guest objects not found."
+            echo "To enable automated binary compilation in CI:"
+            echo "1. Upload 'dist/r36s-guest-objs.tar.gz' to a GitHub Release tagged 'r36s-base-assets'"
+            echo "   OR"
+            echo "2. Add a repository secret named 'GUEST_OBJS_URL' with a direct download link."
+            echo "HAVE_GUEST_OBJS=false" >> $GITHUB_ENV
+          fi
+
+      - name: Build R36S Binary (ARM64)
+        if: env.HAVE_GUEST_OBJS == 'true'
+        run: |
+          GUEST_DIR="$GITHUB_WORKSPACE/build/guest-objs" \
+          BUILD_DIR="$GITHUB_WORKSPACE/build/ci-r36s" \
+          OUT="$GITHUB_WORKSPACE/ports/r36s/package" \
+          bash ports/r36s/build_ci.sh
+
+      - name: Package PortMaster Release Bundle
+        run: |
+          STAGE_DIR="$GITHUB_WORKSPACE/build/package_stage"
+          rm -rf "$STAGE_DIR"
+          mkdir -p "$STAGE_DIR/nfsu2/gamedata"
+
+          cp "$GITHUB_WORKSPACE/ports/r36s/package/NFSU2.sh" "$STAGE_DIR/"
+          cp "$GITHUB_WORKSPACE/ports/r36s/package/port.json" "$STAGE_DIR/nfsu2/"
+          cp "$GITHUB_WORKSPACE/ports/r36s/package/nfsu2.gptk" "$STAGE_DIR/nfsu2/"
+          cp "$GITHUB_WORKSPACE/ports/r36s/package/README.md" "$STAGE_DIR/nfsu2/"
+          cp -r "$GITHUB_WORKSPACE/ports/r36s/package/widescreen" "$STAGE_DIR/nfsu2/"
+
+          cat << 'EOF' > "$STAGE_DIR/nfsu2/gamedata/COPY_RETAIL_PC_FILES_HERE.txt"
+Need for Speed: Underground 2 — PortMaster
+==========================================
+
+Copy your retail PC game files here:
+- SPEED2.EXE
+- GLOBAL/
+- CARS/
+- TRACKS/
+- SOUND/
+- MOVIES/
+- LANGUAGES/
+EOF
+
+          if [ "$HAVE_GUEST_OBJS" = "true" ] && [ -f "$GITHUB_WORKSPACE/ports/r36s/package/nfsu2.aarch64" ]; then
+            cp "$GITHUB_WORKSPACE/ports/r36s/package/nfsu2.aarch64" "$STAGE_DIR/nfsu2/"
+            echo "Package contains full native nfsu2.aarch64 binary."
+          else
+            echo "Package created without binary (base port configuration)."
+          fi
+
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          (cd "$STAGE_DIR" && zip -r "$GITHUB_WORKSPACE/dist/NFSU2-R36S.zip" NFSU2.sh nfsu2)
+
+          cd "$GITHUB_WORKSPACE/dist"
+          sha256sum NFSU2-R36S.zip > NFSU2-R36S.zip.sha256
+
+      - name: Generate Release Tag & Info
+        id: release_info
+        run: |
+          DATE_TAG="$(date +'%Y%m%d')"
+          SHORT_SHA="$(git rev-parse --short HEAD)"
+
+          if [ -n "${{ github.event.inputs.tag_name }}" ]; then
+            TAG="${{ github.event.inputs.tag_name }}"
+          elif [ "${{ github.event_name }}" = "pull_request" ]; then
+            PR_NUM="${{ github.event.pull_request.number }}"
+            TAG="v1.0.0-r36s-pr${PR_NUM}-${SHORT_SHA}"
+          else
+            TAG="v1.0.0-r36s-${DATE_TAG}-${SHORT_SHA}"
+          fi
+
+          if [ -n "${{ github.event.inputs.release_title }}" ]; then
+            TITLE="${{ github.event.inputs.release_title }}"
+          elif [ "${{ github.event_name }}" = "pull_request" ]; then
+            TITLE="NFSU2 R36S Port - PR #${{ github.event.pull_request.number }}: ${{ github.event.pull_request.title }}"
+          else
+            TITLE="NFSU2 R36S Release ${TAG}"
+          fi
+
+          echo "TAG=$TAG" >> $GITHUB_OUTPUT
+          echo "TITLE=$TITLE" >> $GITHUB_OUTPUT
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release_info.outputs.TAG }}
+          name: ${{ steps.release_info.outputs.TITLE }}
+          draft: ${{ github.event.inputs.draft || false }}
+          prerelease: false
+          generate_release_notes: true
+          files: |
+            dist/NFSU2-R36S.zip
+            dist/NFSU2-R36S.zip.sha256
+          body: |
+            ## 🏎️ Need for Speed: Underground 2 — R36S & PortMaster Release
+
+            - **Target Platform**: Rockchip RK3326 (R36S, RG351MP, RGB20S) / Linux ARM64
+            - **Operating System**: ArkOS, AmberELEC, ROCKNIX
+            - **Graphics**: MojoShader Direct3D 9 to OpenGL ES 2.0 native translation
+            - **Commit**: ${{ github.sha }}
+
+            ### 💾 Installation:
+            1. Download `NFSU2-R36S.zip` and extract to your SD card under `ports/`.
+            2. Copy your legitimate retail PC Need for Speed: Underground 2 files into `ports/nfsu2/gamedata/` (`SPEED2.EXE`, `GLOBAL/`, `CARS/`, `TRACKS/`, `SOUND/`, etc.).
+            3. Launch from your handheld's Ports menu.
