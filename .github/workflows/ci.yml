@@ -29,14 +29,13 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Install ARM64 Cross Toolchain & Python
+      - name: Install ARM64 Cross Toolchain
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             gcc-aarch64-linux-gnu \
             g++-aarch64-linux-gnu \
-            binutils-aarch64-linux-gnu \
-            python3
+            binutils-aarch64-linux-gnu
 
       - name: Compile Translation Runtime & Engine Overrides
         run: |

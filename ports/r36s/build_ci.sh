@@ -6,7 +6,6 @@
 set -e
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-PCRECOMP="${PCRECOMP:-$ROOT/../pcrecomp}"
 BUILD_DIR="${BUILD_DIR:-$ROOT/build/ci-r36s}"
 OUT="${OUT:-$ROOT/ports/r36s/package}"
 GUEST_DIR="${GUEST_DIR:-$BUILD_DIR/guest-objs}"
@@ -29,41 +28,13 @@ echo "============================================================"
 
 mkdir -p "$BUILD_DIR/obj" "$OUT"
 
-# 1. Fetch & patch pcrecomp if needed
-if [ ! -d "$PCRECOMP/runtime/recomp32" ]; then
-    echo "[INFO] Setting up pcrecomp..."
-    mkdir -p "$(dirname "$PCRECOMP")"
-    if [ ! -d "$PCRECOMP/.git" ]; then
-        git clone https://github.com/sp00nznet/pcrecomp.git "$PCRECOMP"
-        git -C "$PCRECOMP" checkout 35548b8d0fd8aa853da67edcf7cd6134f6b9cdc7
-    fi
-    echo "[INFO] Applying patches from patches/pcrecomp/..."
-    for p in "$ROOT"/patches/pcrecomp/*.patch; do
-        if [ -f "$p" ]; then
-            git -C "$PCRECOMP" apply "$p"
-        fi
-    done
-fi
+# 1. SDK Include paths (self-contained within repository)
+SDK="$ROOT/ports/r36s/sdk/include"
+SDK_INC="-I$SDK -I$SDK/SDL2"
+DXVK_INC="-I$SDK/dxvk -I$SDK/dxvk/native -I$SDK/dxvk/native/windows -I$SDK/dxvk/native/directx"
+RECOMP_INC="-I$SDK/recomp32 -I$SDK/win32hle"
 
-# 2. Fetch DXVK native headers if needed
-DXVK="$ROOT/build/dxvk-source/include/native"
-if [ ! -f "$DXVK/windows/d3d9.h" ]; then
-    echo "[INFO] Fetching DXVK native D3D9 headers..."
-    mkdir -p "$ROOT/build"
-    TMP_DXVK="$ROOT/build/dxvk-native-tmp"
-    rm -rf "$TMP_DXVK"
-    git clone --depth 1 --branch native-1.9.2b https://github.com/Joshua-Ashton/dxvk-native.git "$TMP_DXVK"
-    python3 "$ROOT/ports/dxvk_android/prepare.py" "$TMP_DXVK" "$ROOT/build/dxvk-source"
-    rm -rf "$TMP_DXVK"
-fi
-
-# 3. Locate SDL2 & GLES2 headers (use bundled SDK headers for exact reproduction)
-SDK_INC="-I$ROOT/ports/r36s/sdk/include -I$ROOT/ports/r36s/sdk/include/SDL2"
-if [ ! -d "$ROOT/ports/r36s/sdk/include/SDL2" ] && [ -d "/usr/include/SDL2" ]; then
-    SDK_INC="-I/usr/include -I/usr/include/SDL2"
-fi
-
-# 4. Verify guest objects (only if linking)
+# 2. Verify guest objects (only if linking)
 if [ "$COMPILE_ONLY" != "1" ]; then
     if [ ! -d "$GUEST_DIR" ] || [ -z "$(find "$GUEST_DIR" -name '*.o' 2>/dev/null | head -1)" ]; then
         echo "[ERROR] No compiled guest objects (*.o) found in $GUEST_DIR!"
@@ -74,11 +45,11 @@ if [ "$COMPILE_ONLY" != "1" ]; then
     echo "[INFO] Found $GUEST_OBJ_COUNT precompiled guest objects in $GUEST_DIR."
 fi
 
-# 5. Compile flags
+# 3. Compile flags
 MOJO="$ROOT/third_party/mojoshader"
 MOJODEF="-DSUPPORT_PROFILE_ARB1=0 -DSUPPORT_PROFILE_ARB1_NV=0 -DSUPPORT_PROFILE_HLSL=0 -DSUPPORT_PROFILE_METAL=0 -DSUPPORT_PROFILE_D3D=0 -DSUPPORT_PROFILE_BYTECODE=0 -DSUPPORT_PROFILE_SPIRV=0 -DSUPPORT_PROFILE_GLSPIRV=0 -DMOJOSHADER_DEPTH_CLIPPING -DMOJOSHADER_FLIP_RENDERTARGET"
-GLESINC="-I$ROOT/ports/r36s/d3d9_gles -I$MOJO -I$ROOT/build/dxvk-source/include -I$DXVK -I$DXVK/windows -I$DXVK/directx $SDK_INC"
-APPINC="-I$ROOT/ports/r36s -I$ROOT/ports/r36s/d3d9_gles -I$ROOT/android/app/src/main/cpp -I$ROOT/src/runtime -I$ROOT/src/platform -I$PCRECOMP/runtime/recomp32 -I$PCRECOMP/runtime/win32hle $SDK_INC -isystem $ROOT/build/dxvk-source/include -isystem $DXVK -isystem $DXVK/windows -isystem $DXVK/directx"
+GLESINC="-I$ROOT/ports/r36s/d3d9_gles -I$MOJO $DXVK_INC $SDK_INC"
+APPINC="-I$ROOT/ports/r36s -I$ROOT/ports/r36s/d3d9_gles -I$ROOT/android/app/src/main/cpp -I$ROOT/src/runtime -I$ROOT/src/platform $RECOMP_INC $SDK_INC -isystem $SDK/dxvk -isystem $SDK/dxvk/native -isystem $SDK/dxvk/native/windows -isystem $SDK/dxvk/native/directx"
 APPDEF="-DRECOMP_TLS=__thread -DRECOMP_TLS_STRUCT -DNFS_PARALLEL_GUEST -DNFS_FIXED_GUEST_BASE=0x1000000000ULL -DNFS_R36S -DNFS_GLES -DNFS_D3D9_BACKEND -DNFS_SDL_AUDIO -DRECOMP_STRICT_ICALL -DRECOMP_X87_WINDOW $MOJODEF"
 OPT="-O2 -g0 -DNDEBUG -fno-strict-aliasing -ffp-contract=off"
 
@@ -105,7 +76,7 @@ compile() {
     fi
 }
 
-# 6. Compilation of runtime and translation layer
+# 4. Compilation of runtime and translation layer
 compile "$ROOT/ports/r36s/d3d9_gles/d3d9_gles.cpp" "$BUILD_DIR/obj/d3d9_gles.o" "$CXX" -std=c++17 $OPT $MOJODEF -DNFS_R36S -DNFS_GLES $GLESINC
 for c in mojoshader.c mojoshader_common.c profiles/mojoshader_profile_common.c profiles/mojoshader_profile_glsl.c; do
     compile "$MOJO/$c" "$BUILD_DIR/obj/$(basename "$c" .c).o" "$CC" $OPT $MOJODEF -DNFS_R36S -DNFS_GLES -I"$MOJO"
@@ -127,7 +98,7 @@ if [ "$COMPILE_ONLY" = "1" ]; then
     exit 0
 fi
 
-# 7. Generate GLESv2 and SDL2 stubs for clean dynamic linking on RK3326 ArkOS
+# 5. Generate GLESv2 and SDL2 stubs for clean dynamic linking on RK3326 ArkOS
 STUB="$BUILD_DIR/stubs"
 mkdir -p "$STUB"
 
@@ -139,7 +110,7 @@ nm -u "$BUILD_DIR"/obj/*.o | awk '{print $2}' | grep -E '^gl[A-Z]' | sort -u | s
 nm -u "$BUILD_DIR"/obj/*.o | awk '{print $2}' | grep -E '^SDL_' | sort -u | sed 's/.*/void &(void){}/' > "$STUB/stub_sdl.c"
 "$CC" -shared -fPIC -o "$STUB/libSDL2.so" -Wl,-soname,libSDL2-2.0.so.0 "$STUB/stub_sdl.c"
 
-# 8. Link final binary
+# 6. Link final binary
 echo "  LD $OUT/nfsu2.aarch64"
 "$CXX" -o "$OUT/nfsu2.aarch64" \
     "$BUILD_DIR"/obj/*.o \
@@ -147,7 +118,7 @@ echo "  LD $OUT/nfsu2.aarch64"
     -L"$STUB" \
     -lSDL2 -lGLESv2 -lpthread -ldl -lm -rdynamic -no-pie
 
-# 9. Strip and verify
+# 7. Strip and verify
 "$STRIP" --strip-debug "$OUT/nfsu2.aarch64"
 chmod 755 "$OUT/nfsu2.aarch64"
 
