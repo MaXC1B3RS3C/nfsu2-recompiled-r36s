@@ -538,6 +538,11 @@ int main(int argc, char** argv) {
 
     uint32_t autoTick = 0;
     while (g_running) {
+        if (g_guestWorker.isFinished()) {
+            std::printf("[NFSU2] Guest runtime terminated (%s). Exiting main loop.\n", g_guestWorker.status().c_str());
+            g_running = false;
+            break;
+        }
         auto frameStart = std::chrono::steady_clock::now();
 
         if (config.autoAdvance) {

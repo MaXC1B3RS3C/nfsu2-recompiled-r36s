@@ -16,6 +16,7 @@
 #include <atomic>
 #include <chrono>
 #include <thread>
+#include <mutex>
 #include <cstdlib>
 
 extern "C" IDirect3D9* Direct3DCreate9(UINT sdk);
@@ -34,8 +35,9 @@ constexpr uint32_t methodBase=0x7e000000;
 enum class Kind:uint32_t {D3D9=1,Device=2,Texture=3,Cube=4,Surface=5,VertexBuffer=6,IndexBuffer=7,
     VertexShader=8,PixelShader=9,Declaration=10,StateBlock=11,Query=12,SwapChain=13,VolumeTexture=14,Volume=15};
 struct Object {IUnknown* native;Kind kind;uint32_t references=1;CompressedView compressed;uint32_t parent=0;uint32_t children=0;int32_t refDelta=0;bool refQueued=false;};
+std::recursive_mutex objectsMutex;
 std::unordered_map<uint32_t,Object> objects;
-uint64_t objectsEpoch=0;  // bumped when a guest handle is created or retired (render-thread caches)
+std::atomic<uint64_t> objectsEpoch{0};  // bumped when a guest handle is created or retired (render-thread caches)
 std::map<IUnknown*,uint32_t> addresses;
 void* guestBase;
 uint32_t (*allocateGuest)(uint32_t);
@@ -45,12 +47,14 @@ std::atomic<bool> surfaceRequested{false},surfaceAvailable{false};
 void* pointer(uint32_t address){return address?static_cast<uint8_t*>(guestBase)+address:nullptr;}
 void write(uint32_t address,uint32_t value){if(!address)throw std::runtime_error("Null D3D9 output");std::memcpy(pointer(address),&value,4);}
 uint32_t wrap(IUnknown* native,Kind kind){
-    if(!native)return 0;auto previous=addresses.find(native);if(previous!=addresses.end()){++objects.at(previous->second).references;return previous->second;}
+    if(!native)return 0;
+    std::lock_guard<std::recursive_mutex> lock(objectsMutex);
+    auto previous=addresses.find(native);if(previous!=addresses.end()){++objects.at(previous->second).references;return previous->second;}
     static constexpr uint32_t sizes[]={0,17,119,22,22,17,14,14,5,5,5,6,8,10,22,11};
     uint32_t count=sizes[static_cast<uint32_t>(kind)];
     uint32_t table=allocateGuest(count*4),object=allocateGuest(4);
     for(uint32_t i=0;i<count;++i)write(table+i*4,methodBase+static_cast<uint32_t>(kind)*4096+i*16);
-    write(object,table);objects.emplace(object,Object{native,kind});addresses.emplace(native,object);++objectsEpoch;return object;
+    write(object,table);objects.emplace(object,Object{native,kind});addresses.emplace(native,object);objectsEpoch.fetch_add(1,std::memory_order_release);return object;
 }
 // The guest handle's kind decides the interface: D3D9 interfaces form single
 // inheritance chains from IUnknown, so once the kind matches, static_cast is
@@ -68,24 +72,41 @@ template<class T>bool kindMatches(Kind kind){
     else return false;
 }
 template<class T>T* nativeObject(uint32_t address){
-    if(!address)return nullptr;auto found=objects.find(address);if(found==objects.end())throw std::runtime_error("Invalid D3D9 resource handle");
+    if(!address)return nullptr;
+    std::lock_guard<std::recursive_mutex> lock(objectsMutex);
+    auto found=objects.find(address);
+    if(found==objects.end()){
+        static uint32_t warned=0;
+        if(warned++<20)NFS_RUNTIME_LOG(ANDROID_LOG_WARN,"NFSU2","nativeObject: handle %08x not found in D3D9 objects map",address);
+        return nullptr;
+    }
     if(kindMatches<T>(found->second.kind))return static_cast<T*>(found->second.native);
-    auto native=dynamic_cast<T*>(found->second.native);if(!native)throw std::runtime_error("D3D9 resource interface mismatch");return native;
+    auto native=dynamic_cast<T*>(found->second.native);
+    if(!native){
+        static uint32_t warnedMismatch=0;
+        if(warnedMismatch++<20)NFS_RUNTIME_LOG(ANDROID_LOG_WARN,"NFSU2","nativeObject: interface mismatch for handle %08x kind %u",address,static_cast<uint32_t>(found->second.kind));
+        return nullptr;
+    }
+    return native;
 }
 uint32_t wrapTexture(IDirect3DBaseTexture9* texture){if(!texture)return 0;switch(texture->GetType()){case D3DRTYPE_TEXTURE:return wrap(texture,Kind::Texture);case D3DRTYPE_CUBETEXTURE:return wrap(texture,Kind::Cube);case D3DRTYPE_VOLUMETEXTURE:return wrap(texture,Kind::VolumeTexture);default:throw std::runtime_error("Unknown D3D9 base texture type");}}
 void retireGuestObject(uint32_t address){
+    std::lock_guard<std::recursive_mutex> lock(objectsMutex);
     auto found=objects.find(address);if(found==objects.end())return;
 #if defined(NFS_R36S)
     if(found->second.kind==Kind::VertexBuffer||found->second.kind==Kind::IndexBuffer)::rt::forgetBufferShadow(address);
     if(found->second.kind==Kind::Texture)::rt::forgetTextureLocks(address);
 #endif
     uint32_t table;std::memcpy(&table,pointer(address),4);
-    freeGuest(table);freeGuest(address);addresses.erase(found->second.native);objects.erase(found);++objectsEpoch;
+    freeGuest(table);freeGuest(address);addresses.erase(found->second.native);objects.erase(found);objectsEpoch.fetch_add(1,std::memory_order_release);
 }
 void attachTextureSurface(uint32_t texture,uint32_t surface){
     if(!surface)return;
-    auto& child=objects.at(surface);
-    if(!child.parent){child.parent=texture;++objects.at(texture).children;}
+    std::lock_guard<std::recursive_mutex> lock(objectsMutex);
+    auto itChild=objects.find(surface);if(itChild==objects.end())return;
+    auto itParent=objects.find(texture);if(itParent==objects.end())return;
+    auto& child=itChild->second;
+    if(!child.parent){child.parent=texture;++itParent->second.children;}
     else if(child.parent!=texture)throw std::runtime_error("D3D9 subresource changed parent");
 }
 // Underground 2 copies its initial depth surface from 0x870854 into the first
@@ -93,11 +114,16 @@ void attachTextureSurface(uint32_t texture,uint32_t surface){
 // The copy does not call AddRef, so account for that owned descriptor here.
 void retainInitialDepthDescriptor(uint32_t outputAddress,uint32_t surfaceAddress){
     if(outputAddress!=0x870854||!surfaceAddress)return;
-    auto& surface=objects.at(surfaceAddress);surface.native->AddRef();++surface.references;
+    std::lock_guard<std::recursive_mutex> lock(objectsMutex);
+    auto it=objects.find(surfaceAddress);
+    if(it!=objects.end()){it->second.native->AddRef();++it->second.references;}
 }
 float floatValue(uint32_t bits){float value;std::memcpy(&value,&bits,4);return value;}
 uint32_t floatBits(float value){uint32_t bits;std::memcpy(&bits,&value,4);return bits;}
-CompressedView compressionView(uint32_t address){auto found=objects.find(address);return found==objects.end()?CompressedView{}:found->second.compressed;}
+CompressedView compressionView(uint32_t address){
+    std::lock_guard<std::recursive_mutex> lock(objectsMutex);
+    auto found=objects.find(address);return found==objects.end()?CompressedView{}:found->second.compressed;
+}
 // DXVK lets the CPU run at most BackBufferCount+1 frames ahead of the GPU.
 // Fewer back buffers (the game's request is logged) serialise a CPU-heavy frame
 // with its GPU work (Present waited 7-10 ms with the GPU 67% busy). Two
@@ -159,6 +185,7 @@ void shutdownD3D9Bridge(){
     shutdownD3D9BridgeNow();
 }
 static void shutdownD3D9BridgeNow(){
+    std::lock_guard<std::recursive_mutex> lock(objectsMutex);
     for(auto& lock:resourceLocks)freeGuest(lock.second.guest);resourceLocks.clear();
     for(uint32_t kind=15;kind;--kind)for(auto it=objects.begin();it!=objects.end();){
         if(static_cast<uint32_t>(it->second.kind)!=kind){++it;continue;}
@@ -219,6 +246,7 @@ static uint32_t dispatchGuestD3D9Inner(uint32_t token,const uint32_t* args,uint3
     static const int seqFrame=[]{const char* e=std::getenv("NFSU2_COM_SEQ");return e?std::atoi(e):-1;}();
     if(seqFrame>=0&&static_cast<int>(getD3D9PresentCount())==seqFrame)
         NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSU2","COM seq kind=%u method=%u obj=%08x a1=%08x a2=%08x a3=%08x",kind,method,args[0],args[1],args[2],args[3]);
+    std::lock_guard<std::recursive_mutex> lock(objectsMutex);
     auto found=objects.find(args[0]);
     if(found==objects.end()||static_cast<uint32_t>(found->second.kind)!=kind){
         NFS_RUNTIME_LOG(ANDROID_LOG_ERROR,"NFSU2","Invalid D3D9 COM call object=%08x token=%08x kind=%u method=%u actualKind=%u",args[0],token,kind,method,

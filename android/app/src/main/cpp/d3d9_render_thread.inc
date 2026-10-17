@@ -273,18 +273,22 @@ template<class T>T* cachedNative(uint32_t address){
     struct Entry{uint32_t address;uint64_t epoch;void* native;};
     static thread_local Entry cache[256];
     Entry& e=cache[(address>>3)&255];
-    if(e.address==address&&e.epoch==objectsEpoch)return static_cast<T*>(e.native);
+    const uint64_t curEpoch=objectsEpoch.load(std::memory_order_acquire);
+    if(e.address==address&&e.epoch==curEpoch)return static_cast<T*>(e.native);
     T* native=nativeObject<T>(address);
-    e={address,objectsEpoch,native};return native;
+    e={address,curEpoch,native};return native;
 }
 // Same for the Object records (AddRef/Release of textures: thousands per frame).
 Object* cachedObject(uint32_t address){
+    if(!address)return nullptr;
     struct Entry{uint32_t address;uint64_t epoch;Object* object;};
     static thread_local Entry cache[256];
     Entry& e=cache[(address>>3)&255];
-    if(e.address==address&&e.epoch==objectsEpoch&&e.object)return e.object;
+    const uint64_t curEpoch=objectsEpoch.load(std::memory_order_acquire);
+    if(e.address==address&&e.epoch==curEpoch)return e.object;
+    std::lock_guard<std::recursive_mutex> lock(objectsMutex);
     auto found=objects.find(address);Object* o=found==objects.end()?nullptr:&found->second;
-    e={address,objectsEpoch,o};return o;
+    e={address,curEpoch,o};return o;
 }
 // Dynamic vertex/index buffers: Lock/Unlock without waiting for the render thread. Each dynamic buffer gets a
 // permanent guest-memory copy (filled once from the native buffer); Lock returns a pointer into it, Unlock
@@ -482,9 +486,11 @@ bool tryDeferImpl(uint32_t kind,uint32_t method,const uint32_t* args,uint32_t* c
         // The game has one device: remember its handle -> native mapping (objects is only modified by
         // synchronous calls, on the render thread while this thread waits, and Release of the device).
         static uint32_t cachedHandle=0;static IUnknown* cachedDevice=nullptr;static uint64_t cachedEpoch=~0ull;
-        if(args[0]!=cachedHandle||cachedEpoch!=objectsEpoch){
+        const uint64_t curEpoch=objectsEpoch.load(std::memory_order_acquire);
+        if(args[0]!=cachedHandle||cachedEpoch!=curEpoch){
+            std::lock_guard<std::recursive_mutex> lock(objectsMutex);
             auto found=objects.find(args[0]);if(found==objects.end()||found->second.kind!=Kind::Device)return false;
-            cachedHandle=args[0];cachedDevice=found->second.native;cachedEpoch=objectsEpoch;
+            cachedHandle=args[0];cachedDevice=found->second.native;cachedEpoch=curEpoch;
         }
         if(method==26||method==27)return createBufferAsync(cachedDevice,method,args,count,result);
         if(filterState(method,args,count)){++filtered;return true;}
@@ -559,6 +565,7 @@ bool tryDeferImpl(uint32_t kind,uint32_t method,const uint32_t* args,uint32_t* c
     if((kind==6||kind==7)&&method==11)return lockBufferAsync(kind,args,count,result);
     if((kind==6||kind==7)&&method==12)return unlockBufferAsync(kind,args,count,result);
     if(kind==11&&(method==4||method==5)){
+        std::lock_guard<std::recursive_mutex> lock(objectsMutex);
         auto found=objects.find(args[0]);if(found==objects.end()||found->second.kind!=Kind::StateBlock)return false;
         if(method==5)forgetShadow();  // Apply changes device state behind the shadow
         Cmd c{};c.op=OpStateBlock;c.method=static_cast<uint16_t>(method);c.obj=found->second.native;*count=1;push(c);return true;
@@ -712,9 +719,11 @@ bool tryDefer(uint32_t kind,uint32_t method,const uint32_t* args,uint32_t* count
 }
 bool hudReplay(){
     if(!hudRec.valid||hudRec.calls.empty())return false;
-    if(hudRec.epoch!=objectsEpoch){
+    const uint64_t curEpoch=objectsEpoch.load(std::memory_order_acquire);
+    if(hudRec.epoch!=curEpoch){
+        std::lock_guard<std::recursive_mutex> lock(objectsMutex);
         for(const auto& o:hudRec.objs){auto f=objects.find(o.first);if(f==objects.end()||f->second.native!=o.second)return false;}
-        hudRec.epoch=objectsEpoch;  // all still alive: no need to check again until the next change
+        hudRec.epoch=curEpoch;  // all still alive: no need to check again until the next change
     }
     if(hudRec.blob.size()>hudScratchSize){
         if(hudScratch)freeGuest(hudScratch);
