@@ -146,8 +146,9 @@ NFSU2_FPS=60
 NFSU2_REGISTRY_EXTRA=""
 NFSU2_GPU_EXTRAS=0
 NFSU2_DRAW_DIST=200
+NFSU2_LANG=English
 [ -f "$GAMEDIR/nfsu2.cfg" ] && . "$GAMEDIR/nfsu2.cfg"
-export NFSU2_DRAW_DIST
+export NFSU2_DRAW_DIST NFSU2_LANG
 for v in NFSU2_ASPECT NFSU2_RENDER_SCALE NFSU2_RENDER NFSU2_SCREEN NFSU2_ROTATE NFSU2_SHOW_FPS; do
   eval "[ -n \"\${$v:-}\" ] && export $v"
 done
@@ -197,7 +198,8 @@ CAP_ARG="--cap60"; [ "$NFSU2_FPS" = "30" ] && CAP_ARG="--cap30"
 [ -f "$GAMEDIR/log.txt" ] && mv -f "$GAMEDIR/log.txt" "$GAMEDIR/log.prev.txt"
 
 # Launch game: GLES 2.0 at the screen's native resolution (see Display above)
-./nfsu2.aarch64 "$GAMEDIR/gamedata" $CAP_ARG > "$GAMEDIR/log.txt" 2>&1
+LANG_ARG="--lang=$NFSU2_LANG"
+./nfsu2.aarch64 "$GAMEDIR/gamedata" $CAP_ARG $LANG_ARG > "$GAMEDIR/log.txt" 2>&1
 EXIT_CODE=$?
 
 # Restore console and services on exit

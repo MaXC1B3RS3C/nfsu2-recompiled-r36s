@@ -214,7 +214,7 @@ uint32_t resourceRva{},resourceSize{};
 // plain globals, not thread_local, which cost a TLS descriptor call per COM call.
 thread_local uint32_t lastImport{};
 std::string hostGameRoot;
-std::string guestLanguage="Spanish";
+std::string guestLanguage="English UK";
 bool guestWidescreen=true;
 std::atomic<bool> stopRequested{false};
 std::atomic<bool> guestPaused{false};
@@ -1257,9 +1257,16 @@ void setGuestOnlineServer(const std::string& host){std::lock_guard<MachineMutex>
 void setGuestWidescreen(bool enabled){std::lock_guard<MachineMutex> lock(machine);if(!memory)guestWidescreen=enabled;}
 void setGuestLanguage(const char* language){
     std::lock_guard<MachineMutex> lock(machine);if(memory)return;
-    for(const char* known:{"Spanish","English UK","French","German","Italian","Dutch","Swedish","Danish","Japanese","Korean","Chinese (Traditional)","Thai"})
+    if(language){
+        if(std::strcmp(language,"English")==0||std::strcmp(language,"english")==0||std::strcmp(language,"en")==0||std::strcmp(language,"English UK")==0||std::strcmp(language,"English US")==0){
+            guestLanguage="English UK";
+            NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSU2","Selected guest language: %s",guestLanguage.c_str());
+            return;
+        }
+    }
+    for(const char* known:{"English UK","Spanish","French","German","Italian","Dutch","Swedish","Danish","Japanese","Korean","Chinese (Traditional)","Thai"})
         if(language&&std::strcmp(known,language)==0){guestLanguage=known;NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSU2","Selected guest language: %s",known);return;}
-    guestLanguage="Spanish";
+    guestLanguage="English UK";
 }
 
 // D3D9 bridge (R36S render thread): wait for the render thread with the guest machine released.

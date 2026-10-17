@@ -39,7 +39,7 @@ constexpr uint32_t R36S_SCREEN_HEIGHT = 480;
 
 struct R36SHostConfig {
     std::string gameDir;
-    std::string language = "Spanish";
+    std::string language = "English UK";
     uint32_t targetWidth = R36S_SCREEN_WIDTH;
     uint32_t targetHeight = R36S_SCREEN_HEIGHT;
     uint32_t frameLimit = 30; // 30 FPS default for Rockchip RK3326 Cortex-A35 thermal & battery stability
@@ -393,6 +393,9 @@ static void chooseResolution(R36SHostConfig& config) {
 int main(int argc, char** argv) {
     R36SHostConfig config;
     config.gameDir = findGamePath(argc, argv);
+    if (const char* envLang = std::getenv("NFSU2_LANG")) {
+        if (envLang[0]) config.language = envLang;
+    }
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
