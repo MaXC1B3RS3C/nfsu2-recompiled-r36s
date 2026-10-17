@@ -39,7 +39,7 @@ constexpr uint32_t R36S_SCREEN_HEIGHT = 480;
 
 struct R36SHostConfig {
     std::string gameDir;
-    std::string language = "English UK";
+    std::string language = "Spanish";
     uint32_t targetWidth = R36S_SCREEN_WIDTH;
     uint32_t targetHeight = R36S_SCREEN_HEIGHT;
     uint32_t frameLimit = 30; // 30 FPS default for Rockchip RK3326 Cortex-A35 thermal & battery stability
