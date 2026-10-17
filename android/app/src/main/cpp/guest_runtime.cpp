@@ -332,7 +332,7 @@ void checkGuestProgress() {
     static thread_local auto nextYield=std::chrono::steady_clock::time_point::min();
     if((++checkpoints&63u)==0){
         auto now=std::chrono::steady_clock::now();
-        if(now>bootDeadline)throw GuestStop("CRT bring-up time budget reached at "+hex(g_cur_func));
+        if(bootDeadline!=std::chrono::steady_clock::time_point::max()&&now>bootDeadline)throw GuestStop("CRT bring-up time budget reached at "+hex(g_cur_func));
         // Time slicing only matters while threads take turns; parallel guest code holds no machine.
         if(now>=nextYield&&(!parallelGuest||machine.heldByMe())){if(machine.hasWaiters())yieldGuestMachine();nextYield=std::chrono::steady_clock::now()+std::chrono::microseconds(500);}
     }
@@ -1103,12 +1103,16 @@ std::string connectGuestRuntime(const char* executable) {
     State original; original.save();
     try {
         stopRequested=false;
-        // Interactive Android sessions stop through lifecycle cancellation.
-#ifdef __ANDROID__
-        bootDeadline=std::chrono::steady_clock::time_point::max();
-#else
-        bootDeadline=std::chrono::steady_clock::now()+std::chrono::minutes(5);
-#endif
+        // Interactive sessions (Android, R36S, Desktop) stop through player exit or signal cancellation.
+        // Optional timeout can be enforced if NFSU2_BOOT_TIMEOUT is explicitly set in seconds (e.g. for CI/benchmarking).
+        const char* timeoutEnv = std::getenv("NFSU2_BOOT_TIMEOUT");
+        if (timeoutEnv && *timeoutEnv) {
+            int seconds = std::atoi(timeoutEnv);
+            bootDeadline = (seconds > 0) ? (std::chrono::steady_clock::now() + std::chrono::seconds(seconds))
+                                         : std::chrono::steady_clock::time_point::max();
+        } else {
+            bootDeadline = std::chrono::steady_clock::time_point::max();
+        }
         recomp_yield_hook=checkGuestProgress;
         memory=std::make_unique<GuestMemory>();
         hostGameRoot=std::string(executable); hostGameRoot=hostGameRoot.substr(0,hostGameRoot.find_last_of('/'));
