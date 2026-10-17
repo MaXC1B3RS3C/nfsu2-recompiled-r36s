@@ -100,8 +100,12 @@ if [ -z "$SWAP_TOTAL" ] || [ "$SWAP_TOTAL" -lt 256 ]; then
 fi
 
 # Verify game assets presence
-if [ ! -f "$GAMEDIR/gamedata/SPEED2.EXE" ] && [ ! -f "$GAMEDIR/gamedata/speed2.exe" ] && \
-   [ ! -f "$GAMEDIR/SPEED2.EXE" ] && [ ! -f "$GAMEDIR/speed2.exe" ]; then
+EXE=""
+for cand in "$GAMEDIR/gamedata/SPEED2.EXE" "$GAMEDIR/gamedata/speed2.exe" "$GAMEDIR/SPEED2.EXE" "$GAMEDIR/speed2.exe"; do
+  if [ -f "$cand" ]; then EXE="$cand"; break; fi
+done
+
+if [ -z "$EXE" ]; then
   printf "\033c" > "$CURR_TTY"
   printf "======================================================================\n" > "$CURR_TTY"
   printf " ERROR: Game assets not found!\n" > "$CURR_TTY"
@@ -111,6 +115,22 @@ if [ ! -f "$GAMEDIR/gamedata/SPEED2.EXE" ] && [ ! -f "$GAMEDIR/gamedata/speed2.e
   printf "======================================================================\n" > "$CURR_TTY"
   sleep 5
   exit 1
+fi
+
+# Verify exact executable version (European v1.2 No-CD required for static recompilation)
+EXESIZE=$(stat -c%s "$EXE" 2>/dev/null || wc -c < "$EXE" | tr -d ' ')
+if [ "$EXESIZE" != "4788224" ]; then
+  echo "[NFSU2 WARN] SPEED2.EXE size is $EXESIZE bytes (expected 4,788,224 for European v1.2)" >> "$GAMEDIR/log.txt" 2>&1
+  if [ "$EXESIZE" = "4800512" ]; then
+    printf "\033c" > "$CURR_TTY" 2>/dev/null || true
+    printf "======================================================================\n" > "$CURR_TTY" 2>/dev/null || true
+    printf " NOTICE: US v1.2 SPEED2.EXE detected (4,800,512 bytes)!\n" > "$CURR_TTY" 2>/dev/null || true
+    printf " This port was statically recompiled from the European v1.2 binary\n" > "$CURR_TTY" 2>/dev/null || true
+    printf " (4,788,224 bytes, MD5: 95b4dc3e9a6c72b06a8bd62b0c56ea63).\n" > "$CURR_TTY" 2>/dev/null || true
+    printf " The US binary may freeze during startup. Continuing in 4 seconds...\n" > "$CURR_TTY" 2>/dev/null || true
+    printf "======================================================================\n" > "$CURR_TTY" 2>/dev/null || true
+    sleep 4
+  fi
 fi
 
 # Unbind vtconsole to allow KMSDRM full access to DRM primary plane

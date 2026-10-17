@@ -18,7 +18,7 @@ Copy the files to your SD card (either `TF1` or `TF2/EASYROMS`) under the `ports
     ├── libs/                       <- Bundled runtime libraries (libSDL2, etc.)
     ├── widescreen/                 <- HUD layout for wide screens (ThirteenAG's widescreen fix, MIT)
     └── gamedata/                   <- YOUR PC GAME FILES GO HERE
-        ├── SPEED2.EXE              <- Unpacked PC executable
+        ├── SPEED2.EXE              <- European v1.2 No-CD executable (exactly 4,788,224 bytes)
         ├── GLOBAL/                 <- Global assets (GLOBALB.BUN, etc.)
         ├── CARS/                   <- Car models, textures, vinyls
         ├── TRACKS/                 <- City tracks and collision data
@@ -30,6 +30,13 @@ Copy the files to your SD card (either `TF1` or `TF2/EASYROMS`) under the `ports
 
 > [!IMPORTANT]
 > **No copyrighted game assets are bundled.** You must provide your own legitimate retail PC copy of Need for Speed: Underground 2.
+>
+> **Required Executable**:
+> * Must be **v1.2 European / Multi-Language No-CD**
+> * Exact File Size: **`4,788,224 bytes`** (~4.57 MB)
+> * MD5: `95b4dc3e9a6c72b06a8bd62b0c56ea63`
+> * SHA-256: `04b83e2d13c91c6ec294b578a08240ebcfff6fa9513df584edaa968e4ab9990c`
+> * *Note: Do not use the US v1.2 binary (4,800,512 bytes) or v1.0/v1.1, as static code offsets differ.*
 
 ---
 
