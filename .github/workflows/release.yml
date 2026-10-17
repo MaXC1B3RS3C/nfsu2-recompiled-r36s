@@ -113,6 +113,7 @@ jobs:
           cp "$GITHUB_WORKSPACE/ports/r36s/package/port.json" "$STAGE_DIR/nfsu2/"
           cp "$GITHUB_WORKSPACE/ports/r36s/package/nfsu2.gptk" "$STAGE_DIR/nfsu2/"
           cp "$GITHUB_WORKSPACE/ports/r36s/package/README.md" "$STAGE_DIR/nfsu2/"
+          cp "$GITHUB_WORKSPACE/ports/r36s/package/nfsu2.cfg" "$STAGE_DIR/nfsu2/"
           cp -r "$GITHUB_WORKSPACE/ports/r36s/package/widescreen" "$STAGE_DIR/nfsu2/"
 
           printf "%s\n" \
@@ -186,6 +187,9 @@ jobs:
             - **Operating System**: ArkOS, AmberELEC, ROCKNIX
             - **Graphics**: MojoShader Direct3D 9 to OpenGL ES 2.0 native translation
             - **Commit**: ${{ github.sha }}
+
+            ### 🙏 Acknowledgements & Credits
+            Special thanks to **codepdbh** and contributors to the [NFSU2 Recompiled project](https://github.com/codepdbh/nfsu2-recompiled) for making this native recompiled engine possible!
 
             ### 💾 Installation:
             1. Download `NFSU2-R36S.zip` and extract to your SD card under `ports/`.
