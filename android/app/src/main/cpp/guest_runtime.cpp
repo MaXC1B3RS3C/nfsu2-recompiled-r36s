@@ -673,6 +673,10 @@ void loadImage(const char* path) {
         std::memcpy(ptr(imageBase+sec.VirtualAddress,sec.SizeOfRawData),file.data()+sec.PointerToRawData,sec.SizeOfRawData);
     }
     entry=imageBase+opt.AddressOfEntryPoint;
+    if (entry == 0x0075bcc7u && !recomp_lookup(0x0075bcc7u) && recomp_lookup(0x0075b9f1u)) {
+        NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSU2","Remapping entry point 0x0075bcc7 -> 0x0075b9f1 (WinMainCRTStartup)");
+        entry = 0x0075b9f1u;
+    }
     // Guest VAs stay fixed; the 64-bit host base is ADDR's offset. No PE
     // relocation toward the host address and no executable x86 mapping.
     auto directory=opt.DataDirectory[PE_DIR_IMPORT];
@@ -941,12 +945,14 @@ void lockedRuntimeTrampoline(){
 recomp_func_t lookupManualUnlocked(uint32_t va){
     if(timerTestActive&&va==timerTestAddress)return timerTestCallback;
     if(generatedTestActive&&va==generatedTestTarget)return generatedTestCallback;
+    if(va==0x0075bcc7u&&recomp_lookup(0x0075b9f1u))return recomp_lookup(0x0075b9f1u);
     if(va>=GuestHeaps::firstArena&&va<GuestHeaps::firstArenaEnd&&memory&&memory->readable(va,5)&&read32(va)==0x24748b56u&&*static_cast<const uint8_t*>(ptr(va+4,1))==8){
         dynamicThunkAddress=va;return dynamicThunk;
     }
     return nfs_override_lookup(va);
 }
 extern "C" recomp_func_t recomp_lookup_manual(uint32_t va) {
+    if(va==0x0075bcc7u&&recomp_lookup(0x0075b9f1u))return recomp_lookup(0x0075b9f1u);
     // Threads that take turns hold the machine already (taking it again would leave the handler's own
     // yields unable to release it): only free-running threads go through the trampoline.
     if(!parallelGuest||!freeRunning)return lookupManualUnlocked(va);
