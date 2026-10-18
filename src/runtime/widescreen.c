@@ -163,6 +163,61 @@ void nfs_widescreen_apply_frame_rate(void) {
 
 static void set_esp_float(uint32_t offset, float value) { wrf(g_esp + offset, value); }
 
+/* The four "centred full-screen quad" siblings - sub_005364E0 (EA Games / THX
+ * logos), sub_005366E0 (NFSU2 title card and loading screens), sub_00536910 and
+ * sub_00536BF0 - all place a quad at (320,240) and build its matrix with
+ * sub_0051AD40.  They carry 4:3 art, so on a wider target they have to be
+ * pillarboxed: full height, centred, black bars at the sides.
+ *
+ * On a non-4:3 target the projection compresses the whole Y axis of that matrix
+ * by 1/w^2 (w = aspect/(4/3)): the game's own quad lands as 640x270 with its
+ * centre on y=135 at 16:9 instead of 640x480 at 240 (measured at 854x480 and
+ * 1280x720).  X is untouched (1:1, scaled only by H/480).  Pre-multiplying the
+ * design Y - both the model extents and the position - by w^2 undoes it:
+ *
+ *     hx = 0.5            640 px wide (the pillarbox width on any target)
+ *     hy = 0.5 * w2       0.889 at 16:9 -> the full height
+ *     X  = s_hud_pos_x    240*aspect -> the screen centre
+ *     Y  = 240 * w2       426.7 at 16:9
+ *
+ * At 4:3 w2 == 1, so every value equals the game's own 0.5 / 0.5 / 320 / 240
+ * and the 4:3 picture is untouched.  NFSU2_MOVIE="hx,hy" and NFSU2_MOVIE_Y are
+ * diagnostics. */
+static float fmv_w2(void) {
+    float w = s_aspect / (4.0f / 3.0f);
+    return w * w;
+}
+
+/* The four model half-extents (x0,y0,x1,y1) the siblings pushed for
+ * sub_00519E50; they are the top of the stack at the hook. */
+static void fmv_extents(void) {
+    static int init = 0; static float ohx = 0.0f, ohy = 0.0f;
+    if (!init) { init = 1; const char* e = getenv("NFSU2_MOVIE"); if (e) sscanf(e, "%f,%f", &ohx, &ohy); }
+    float hx = 0.5f, hy = 0.5f * fmv_w2();
+    if (ohx > 0.0f) { hx = ohx; hy = ohy; }
+    set_esp_float(0x0, -hx); set_esp_float(0x4, -hy);
+    set_esp_float(0x8,  hx); set_esp_float(0xC,  hy);
+}
+
+/* The quad's position Y, corrected onto the centred 4:3 row. */
+static void fmv_center_y(uint32_t offset) {
+    static int init = 0; static float ov = -1.0f;
+    if (!init) { init = 1; const char* y = getenv("NFSU2_MOVIE_Y"); if (y) ov = (float)atof(y); }
+    set_esp_float(offset, ov >= 0.0f ? ov : 240.0f * fmv_w2());
+}
+
+/* Diagnostic: give each of the four centred-quad anchor hooks a distinct X so the
+ * frame shows which lifted function draws what (NFSU2_WS_ANCHOR="a,b,c,d"). */
+static float anchor_x(int idx) {
+    static float v[4] = { -1, -1, -1, -1 };
+    if (v[0] < 0) {
+        const char* e = getenv("NFSU2_WS_ANCHOR");
+        v[0] = v[1] = v[2] = v[3] = s_hud_pos_x;
+        if (e) sscanf(e, "%f,%f,%f,%f", &v[0], &v[1], &v[2], &v[3]);
+    }
+    return v[idx];
+}
+
 void recomp_hook(uint32_t va) {
     if (!s_enabled && va != 0x005D2962u && va != 0x005D2C12u) return;
     { static int t = -1; static uint32_t seen[64]; static int ns;
@@ -177,22 +232,22 @@ void recomp_hook(uint32_t va) {
 
     case 0x0053655Cu:
     case 0x005368CCu:
-        set_esp_float(0x74, s_hud_pos_x);
+        set_esp_float(0x74, anchor_x(0));
         break;
 
     case 0x0053672Du:
     case 0x00536A9Du:
-        set_esp_float(0x84, s_hud_pos_x);
+        set_esp_float(0x84, anchor_x(1));
         break;
 
     case 0x0053695Du:
     case 0x00536CCDu:
-        set_esp_float(0x94, s_hud_pos_x);
+        set_esp_float(0x94, anchor_x(2));
         break;
 
     case 0x00536CA5u:
     case 0x00537015u:
-        set_esp_float(0x74, s_hud_pos_x);
+        set_esp_float(0x74, anchor_x(3));
         break;
 
     case 0x0050B099u:
@@ -298,15 +353,31 @@ void recomp_hook(uint32_t va) {
         break;
     }
 
-    /* FMVWidescreenMode = 1 (cropped 16:9): the four pushed quad extents. */
-    case 0x005366C2u:
-    case 0x00536A32u: {
-        if (s_aspect > 4.0f / 3.0f) {
-            const float v = 0.5f * (s_aspect / (4.0f / 3.0f));
-            set_esp_float(0x0, -v); set_esp_float(0x4, -v); set_esp_float(0x8, v); set_esp_float(0xC, v);
-        }
+    /* FMV / loading-screen quads: the four model half-extents (x0,y0,x1,y1) at
+     * the top of the stack, consumed by sub_00519E50.  See fmv_extents(). */
+    case 0x005366C2u:   /* sub_005364E0: EA Games and THX logos */
+    case 0x005368E6u:   /* sub_005366E0: NFSU2 title card and loading screens */
+    case 0x00536BD1u:   /* sub_00536910 */
+        fmv_extents();
         break;
-    }
+
+    /* The same quad's position Y, right after the game stored (320,240,0) and
+     * just before sub_0051AD40 turns it into the matrix.  See fmv_center_y(). */
+    case 0x0053656Cu:   /* sub_005364E0: EA Games / THX */
+        fmv_center_y(0x78);
+        break;
+
+    case 0x00536743u:   /* sub_005366E0: title card / loading screens */
+        fmv_center_y(0x88);
+        break;
+
+    case 0x00536973u:   /* sub_00536910 */
+        fmv_center_y(0x98);
+        break;
+
+    case 0x00536CB5u:   /* sub_00536BF0 */
+        fmv_center_y(0x78);
+        break;
 
     /* FixFOV: ST0 was viewport height/width; the mod loads a per-view scale
      * and picks the constants of the three later reads by view id (ecx). */
