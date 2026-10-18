@@ -1313,8 +1313,12 @@ STDMETHODIMP IDirect3DDevice9GLES::Present(const RECT* pSourceRect, const RECT* 
         std::printf("\n");
     }
     static const bool captureDiagnosticFrames = std::getenv("NFSU2_DIAG_FRAMES") != nullptr;
+    // Frames 0..800 every 10: the boot/loading screen, the EA Games / THX / legal-screen intro quads and
+    // the front-end menus all live there. The old sparse list started at frame 30 and jumped 400 -> 600, so
+    // those screens (and the two quad siblings that only draw during the intro) were never captured.
     if (captureDiagnosticFrames &&
-        ((frame <= 1800 && (frame == 30 || frame == 60 || frame == 180 || frame == 400 || frame == 600 ||
+        ((frame <= 800 && frame % 10 == 0) ||
+         (frame <= 1800 && (frame == 30 || frame == 60 || frame == 180 || frame == 400 || frame == 600 ||
                             frame == 800 || frame == 1000 || frame == 1150 || frame == 1250 || frame == 1400 ||
                             frame == 1600 || frame == 1800)) ||
          (frame > 1800 && frame <= 2450 && (frame % 50 == 0 || frame == 2401)))) {
