@@ -61,17 +61,20 @@ static void load_dat(const char* path) {
 /* MiniMap_Pos_1..4 and MiniMap_Filter_Pos in the mod's .dat (names are not
  * loaded; the anchors are what the game draws them at). */
 static int is_minimap(const hud_entry* e) {
-    int x = (int)e->pos_x, y = (int)e->pos_y;
+    int x = (int)roundf(e->pos_x), y = (int)roundf(e->pos_y);
     return (x == -223 && (y == 70 || y == 71 || y == 142 || y == 143)) || (x == -143 && y == 196);
 }
 
 /* The mod's WidescreenHud(): move a known HUD element by its .dat offset. */
 static void widescreen_hud(float* x, float* y) {
+    if (s_hud_offset <= 0.0f) return;
     const float base_offset = (480.0f * (16.0f / 9.0f) - 640.0f) / 2.0f;
     int ix = (int)floorf(*x), iy = (int)floorf(*y);
+    int rx = (int)roundf(*x), ry = (int)roundf(*y);
     for (unsigned i = 0; i < s_hud_count; i++) {
         const hud_entry* e = &s_hud[i];
-        if ((int)e->pos_x != ix || (int)e->pos_y != iy) continue;
+        int ex = (int)roundf(e->pos_x), ey = (int)roundf(e->pos_y);
+        if ((ex != ix && ex != rx) || (ey != iy && ey != ry)) continue;
         if (e->offset_x >= 0.0f) *x += s_hud_offset + (e->offset_x - base_offset);
         else *x -= s_hud_offset - (e->offset_x + base_offset);
         *y += e->offset_y;
