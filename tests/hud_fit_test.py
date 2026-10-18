@@ -29,6 +29,9 @@ in that space.  The test asserts:
   * on widened aspects the layout actually reaches the new edges (the left-most
     anchor is within `--edge` px of 0 and the right-most within `--edge` px of
     the right edge), which catches "HUD was not widened at all";
+  * the racing-HUD corner spec holds: EA Trax (music) top-left, MiniMap
+    bottom-left, Tachometer (speedo) bottom-right, Leaderboard (names/times)
+    top-right - see HUD_SPEC;
   * the 4:3 layout keeps the original 640-wide framing.
 
 Run:  python3 tests/hud_fit_test.py
@@ -48,6 +51,24 @@ RESOLUTIONS = [
     ("16:9 1280x720", 1280, 720),
     ("16:10 1280x800", 1280, 800),
     ("21:9 2560x1080", 2560, 1080),
+]
+
+# The racing-HUD corner the port must preserve: the *anchor* element of each
+# widget has to land in its screen corner at every aspect (the HUD is only
+# stretched horizontally, so the corner never changes).
+#
+#   music  = EA Trax bar        minimap       = MiniMap
+#   speedo = Tachometer         names/times   = Leaderboard
+#
+# Only the anchor is asserted, not the whole name prefix: the game's own
+# Tachometer_Pos_3/4 slots sit at the middle-left / bottom-left in its native
+# 4:3 layout as well (they are not part of the bottom-right dial), so they are
+# deliberately left where the game puts them.
+HUD_SPEC = [
+    ("EA_Trax_Text_Pos_1", "left", "top"),      # music, top-left
+    ("MiniMap_Pos_1", "left", "bottom"),        # minimap, bottom-left
+    ("Tachometer_Pos_1", "right", "bottom"),    # speedometer, bottom-right
+    ("Leaderboard_Pos_1", "right", "top"),      # racers' names and times, top-right
 ]
 
 
@@ -86,7 +107,8 @@ def move_x(off_x, s_hud_offset):
 def measure(entries, width, height):
     aspect, centre, sh = geometry(width, height)
     vw = 2.0 * centre
-    placed = [(name, centre + px + move_x(ox, sh)) for name, px, py, ox, oy in entries]
+    vy = 240.0                       # the HUD virtual space is 480 px tall
+    placed = [(name, centre + px + move_x(ox, sh), vy + py) for name, px, py, ox, oy in entries]
     return aspect, centre, vw, placed
 
 
@@ -115,6 +137,7 @@ def main():
     failures = 0
     for label, w, h in RESOLUTIONS:
         aspect, centre, vw, placed = measure(entries, w, h)
+        vy = 240.0
         left = min(placed, key=lambda t: t[1])
         right = max(placed, key=lambda t: t[1])
         inside = [t for t in placed if t[1] < 0.0 or t[1] > vw]
@@ -125,6 +148,21 @@ def main():
         if aspect <= 4.0 / 3.0 + 1e-3:
             ok = ok and 0.0 <= left[1] and right[1] <= 640.0
 
+        # the racing-HUD corners (music / minimap / speedo / names+times)
+        by_name = {n: (x, y) for n, x, y in placed}
+        spec_bad = []
+        for name, hpos, vpos in HUD_SPEC:
+            if name not in by_name:
+                spec_bad.append("%s: missing from the table" % name)
+                continue
+            x, y = by_name[name]
+            goth = "left" if x < centre else "right"
+            gotv = "top" if y < vy else "bottom"
+            if goth != hpos or gotv != vpos:
+                spec_bad.append("%s at x=%.0f y=%.0f -> %s/%s, want %s/%s" % (name, x, y, goth, gotv, hpos, vpos))
+        if spec_bad:
+            ok = False
+
         status = "PASS" if ok else "FAIL"
         if not ok:
             failures += 1
@@ -132,9 +170,11 @@ def main():
               % (label, status, vw, centre, left[1], left[0], right[1], right[0]))
         for name, x in inside:
             print("      off-screen: %s at x=%.1f" % (name, x))
+        for msg in spec_bad:
+            print("      HUD spec: %s" % msg)
         if args.verbose:
-            for name, x in sorted(placed, key=lambda t: t[1]):
-                print("      %7.1f  %s" % (x, name))
+            for name, x, y in sorted(placed, key=lambda t: t[1]):
+                print("      %7.1f %6.1f  %s" % (x, y, name))
 
     print("%s (%d/%d resolutions failed)"
           % ("ALL PASS" if failures == 0 else "FAILURES", failures, len(RESOLUTIONS)))
