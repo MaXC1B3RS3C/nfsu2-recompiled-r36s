@@ -88,10 +88,31 @@ static void adjust_mem_pair(uint32_t vx, uint32_t vy) {
 
 void nfs_widescreen_init(const char* game_root) {
     char path[1024];
-    snprintf(path, sizeof path, "%s/scripts/NFSUnderground2.WidescreenFix.dat", game_root);
-    load_dat(path);
-    /* Ports may ship the mod's table themselves (MIT): NFSU2_WIDESCREEN_DAT=<path>. */
-    if (!s_hud_count && getenv("NFSU2_WIDESCREEN_DAT")) load_dat(getenv("NFSU2_WIDESCREEN_DAT"));
+    s_hud_count = 0;
+    if (getenv("NFSU2_WIDESCREEN_DAT")) {
+        load_dat(getenv("NFSU2_WIDESCREEN_DAT"));
+    }
+    if (!s_hud_count && game_root && game_root[0]) {
+        snprintf(path, sizeof path, "%s/widescreen/NFSUnderground2.WidescreenFix.dat", game_root);
+        load_dat(path);
+    }
+    if (!s_hud_count && game_root && game_root[0]) {
+        snprintf(path, sizeof path, "%s/scripts/NFSUnderground2.WidescreenFix.dat", game_root);
+        load_dat(path);
+    }
+    if (!s_hud_count && game_root && game_root[0]) {
+        snprintf(path, sizeof path, "%s/../widescreen/NFSUnderground2.WidescreenFix.dat", game_root);
+        load_dat(path);
+    }
+    if (!s_hud_count) {
+        load_dat("widescreen/NFSUnderground2.WidescreenFix.dat");
+    }
+    if (!s_hud_count) {
+        load_dat("scripts/NFSUnderground2.WidescreenFix.dat");
+    }
+    if (!s_hud_count) {
+        load_dat("ports/r36s/package/widescreen/NFSUnderground2.WidescreenFix.dat");
+    }
     s_enabled = 1;
 }
 
@@ -104,7 +125,8 @@ void nfs_widescreen_set_resolution(unsigned width, unsigned height) {
     s_hud_pos_x = 640.0f / (640.0f * hud_scale_x);
     /* HudAspectRatioConstraint = Auto: -CalculateWidescreenOffset(W, H, 640, 480). */
     s_hud_offset = -((640.0f / 2.0f) - (480.0f / 2.0f) * s_aspect);
-    wrf(0x0079AC0Cu, hud_scale_x);              /* fld [fHudScaleX] */
+    wrf(0x0079AC0Cu, hud_scale_x);              /* fld [fHudScaleX] (EU) */
+    wrf(0x0079AC10u, hud_scale_x);              /* fld [fHudScaleX] (US) */
     wrf(0x00797D50u, s_hud_pos_x);              /* fsub [fHudPosX] */
     wrf(0x00797D58u, s_hud_pos_x * 2.0f);       /* fmul [fHudPosX_x2] */
     /* Dyno result graph origin (float[2]). */
@@ -139,60 +161,154 @@ void nfs_widescreen_apply_frame_rate(void) {
 static void set_esp_float(uint32_t offset, float value) { wrf(g_esp + offset, value); }
 
 void recomp_hook(uint32_t va) {
-    if (!s_enabled && va != 0x005D2962u) return;
+    if (!s_enabled && va != 0x005D2962u && va != 0x005D2C12u) return;
     { static int t = -1; static uint32_t seen[64]; static int ns;
       if (t < 0) t = getenv("NFSU2_WS_TRACE") != NULL;
       if (t) { int k; for (k = 0; k < ns && seen[k] != va; ++k) ; if (k == ns && ns < 64) { seen[ns++] = va; printf("[WS] hook %08x esp=%08x\n", va, g_esp); fflush(stdout); } } }
     switch (va) {
     /* HUD anchors: `mov [esp+N], 320.0` -> fHudPosX (pattern offsets 4/7). */
-    case 0x0051B05Fu: set_esp_float(0xA0, s_hud_pos_x); break;
-    case 0x0053655Cu: set_esp_float(0x74, s_hud_pos_x); break;
-    case 0x0053672Du: set_esp_float(0x84, s_hud_pos_x); break;
-    case 0x0053695Du: set_esp_float(0x94, s_hud_pos_x); break;
-    case 0x00536CA5u: set_esp_float(0x74, s_hud_pos_x); break;
-    case 0x0050B099u: set_esp_float(0x1A0, s_hud_pos_x); break;
-    case 0x0048B5D4u: wrf(0x0082D2D8u, s_hud_pos_x); break;
+    case 0x0051B05Fu:
+    case 0x0051B3CFu:
+        set_esp_float(0xA0, s_hud_pos_x);
+        break;
+
+    case 0x0053655Cu:
+    case 0x005368CCu:
+        set_esp_float(0x74, s_hud_pos_x);
+        break;
+
+    case 0x0053672Du:
+    case 0x00536A9Du:
+        set_esp_float(0x84, s_hud_pos_x);
+        break;
+
+    case 0x0053695Du:
+    case 0x00536CCDu:
+        set_esp_float(0x94, s_hud_pos_x);
+        break;
+
+    case 0x00536CA5u:
+    case 0x00537015u:
+        set_esp_float(0x74, s_hud_pos_x);
+        break;
+
+    case 0x0050B099u:
+    case 0x0050B4F9u:
+        set_esp_float(0x1A0, s_hud_pos_x);
+        break;
+
+    case 0x0048B5D4u:
+    case 0x0048B644u:
+        wrf(0x0082D2D8u, s_hud_pos_x);
+        break;
+
     /* Rear-view mirror quad: 440/200 shifted with the HUD centre. */
-    case 0x005CBDCDu: set_esp_float(0x30, (s_hud_pos_x - 320.0f) + 440.0f); break;
-    case 0x005CBDDDu: set_esp_float(0x40, (s_hud_pos_x - 320.0f) + 200.0f); break;
-    case 0x005CBDEDu: set_esp_float(0x50, (s_hud_pos_x - 320.0f) + 200.0f); break;
-    case 0x005CBDFDu: set_esp_float(0x60, (s_hud_pos_x - 320.0f) + 440.0f); break;
+    case 0x005CBDCDu:
+    case 0x005CC0FDu:
+        set_esp_float(0x30, (s_hud_pos_x - 320.0f) + 440.0f);
+        break;
+
+    case 0x005CBDDDu:
+    case 0x005CC10Du:
+        set_esp_float(0x40, (s_hud_pos_x - 320.0f) + 200.0f);
+        break;
+
+    case 0x005CBDEDu:
+    case 0x005CC11Du:
+        set_esp_float(0x50, (s_hud_pos_x - 320.0f) + 200.0f);
+        break;
+
+    case 0x005CBDFDu:
+    case 0x005CC12Du:
+        set_esp_float(0x60, (s_hud_pos_x - 320.0f) + 440.0f);
+        break;
+
     /* Cutscene letterbox quads (DisableCutsceneBorders = 1). */
-    case 0x005CBBC9u: set_esp_float(0x38, s_disable_cutscene_borders ? 0.0f : s_width); break;
-    case 0x005CBBD9u: set_esp_float(0x48, s_disable_cutscene_borders ? 0.0f : s_width); break;
-    case 0x005CBB5Du: set_esp_float(0x2C, s_disable_cutscene_borders ? 0.0f : s_width); break;
-    case 0x005CBB75u: set_esp_float(0x3C, s_disable_cutscene_borders ? 0.0f : s_width); break;
+    case 0x005CBBC9u:
+    case 0x005CBEF9u:
+        set_esp_float(0x38, s_disable_cutscene_borders ? 0.0f : s_width);
+        break;
+
+    case 0x005CBBD9u:
+    case 0x005CBF09u:
+        set_esp_float(0x48, s_disable_cutscene_borders ? 0.0f : s_width);
+        break;
+
+    case 0x005CBB5Du:
+    case 0x005CBE8Du:
+        set_esp_float(0x2C, s_disable_cutscene_borders ? 0.0f : s_width);
+        break;
+
+    case 0x005CBB75u:
+    case 0x005CBEA5u:
+        set_esp_float(0x3C, s_disable_cutscene_borders ? 0.0f : s_width);
+        break;
+
     /* Radar mask covers the whole render target. */
-    case 0x005C6F3Eu: set_esp_float(0x30, s_width * 2.0f); break;
-    case 0x005C6F4Eu: set_esp_float(0x40, s_width * 2.0f); break;
-    case 0x005C6F56u: set_esp_float(0x44, s_height * 2.0f); break;
-    case 0x005C6F66u: set_esp_float(0x54, s_height * 2.0f); break;
+    case 0x005C6F3Eu:
+    case 0x005C726Eu:
+        set_esp_float(0x30, s_width * 2.0f);
+        break;
+
+    case 0x005C6F4Eu:
+    case 0x005C727Eu:
+        set_esp_float(0x40, s_width * 2.0f);
+        break;
+
+    case 0x005C6F56u:
+    case 0x005C7286u:
+        set_esp_float(0x44, s_height * 2.0f);
+        break;
+
+    case 0x005C6F66u:
+    case 0x005C7296u:
+        set_esp_float(0x54, s_height * 2.0f);
+        break;
+
     /* HudHook: the element position just stored from ecx/edx. */
-    case 0x0051AE28u: adjust_mem_pair(g_esp + 0x60, g_esp + 0x64); break;
+    case 0x0051AE28u:
+    case 0x0051B198u:
+        adjust_mem_pair(g_esp + 0x60, g_esp + 0x64);
+        break;
+
     /* BlipsHook: radar blips, before `mov [edx], ecx`. */
-    case 0x0051D2E5u: adjust_mem_pair(g_ebx + 0x1C, g_ebx + 0x20); g_ecx = MEM32(g_ebx + 0x1C); break;
+    case 0x0051D2E5u:
+    case 0x0051D655u:
+        adjust_mem_pair(g_ebx + 0x1C, g_ebx + 0x20);
+        g_ecx = MEM32(g_ebx + 0x1C);
+        break;
+
     /* HudHook2: ecx = adjusted X of [esi+1C]/[esi+20]. */
-    case 0x004C6589u: {
+    case 0x004C6589u:
+    case 0x004C6759u: {
         float x, y; uint32_t v = g_ecx; memcpy(&x, &v, 4); y = rdf(g_esi + 0x20);
         widescreen_hud(&x, &y); memcpy(&v, &x, 4); g_ecx = v;
         break;
     }
+
     /* StopSignHook: [esi] was ST0 + [edx]; make it ST0 + adjusted [edx]. */
-    case 0x00504D5Fu: {
+    case 0x00504D5Fu:
+    case 0x0050516Fu: {
         float x = rdf(g_edx), y = rdf(g_edx + 4), original = x;
         widescreen_hud(&x, &y);
         wrf(g_esi, rdf(g_esi) + (x - original));
         break;
     }
+
     /* FMVWidescreenMode = 1 (cropped 16:9): the four pushed quad extents. */
-    case 0x005366C2u: {
-        const float v = 0.5f / ((4.0f / 3.0f) / (16.0f / 9.0f));
-        set_esp_float(0x0, -v); set_esp_float(0x4, -v); set_esp_float(0x8, v); set_esp_float(0xC, v);
+    case 0x005366C2u:
+    case 0x00536A32u: {
+        if (s_aspect > 4.0f / 3.0f) {
+            const float v = 0.5f * (s_aspect / (4.0f / 3.0f));
+            set_esp_float(0x0, -v); set_esp_float(0x4, -v); set_esp_float(0x8, v); set_esp_float(0xC, v);
+        }
         break;
     }
+
     /* FixFOV: ST0 was viewport height/width; the mod loads a per-view scale
      * and picks the constants of the three later reads by view id (ecx). */
-    case 0x005C7C34u: {
+    case 0x005C7C34u:
+    case 0x005C7F64u: {
         uint32_t view = g_ecx;
         double hor = 1.0 / (s_aspect / (4.0 / 3.0));
         if (view == 1 || view == 4) { s_fov_scale[0] = hor; s_fov_scale[1] = 0.43511; s_fov_scale[2] = 1.22; }
@@ -200,12 +316,29 @@ void recomp_hook(uint32_t va) {
         g_st[0] = view == 3 ? 0.45 : 1.0;   /* rear-view mirror */
         break;
     }
+
     /* `fdivr [1.0]`, `fmul [0.5]`, `fdivr [1.0]`: rescale by new/original. */
-    case 0x005C7CBEu: g_st[0] *= s_fov_scale[0] / rdf(0x00784250u); break;
-    case 0x005C7CD0u: g_st[0] *= s_fov_scale[1] / rdf(0x00784260u); break;
-    case 0x005C7CF5u: g_st[0] *= s_fov_scale[2] / rdf(0x00784250u); break;
+    case 0x005C7CBEu:
+    case 0x005C7FEEu:
+        g_st[0] *= s_fov_scale[0] / rdf(0x00784250u);
+        break;
+
+    case 0x005C7CD0u:
+    case 0x005C8000u:
+        g_st[0] *= s_fov_scale[1] / rdf(0x00784260u);
+        break;
+
+    case 0x005C7CF5u:
+    case 0x005C8025u:
+        g_st[0] *= s_fov_scale[2] / rdf(0x00784250u);
+        break;
+
     /* FPSLimit: eDisplayFrame pushes 1/60 s as the particle step. */
-    case 0x005D2962u: if (s_frame_time > 0.0f) set_esp_float(0x0, s_frame_time); break;
+    case 0x005D2962u:
+    case 0x005D2C12u:
+        if (s_frame_time > 0.0f) set_esp_float(0x0, s_frame_time);
+        break;
+
     default: break;
     }
 }
