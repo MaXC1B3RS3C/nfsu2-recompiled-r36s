@@ -13,6 +13,15 @@
 #include "recomp_types.h"
 #include "nfs_runtime.h"
 
+/* VA of the indirect call in flight. The guest CPU state is one struct (g_cpu) when a build defines
+ * RECOMP_TLS_STRUCT, otherwise separate thread-local variables; guest_runtime.cpp defines both. */
+#ifdef RECOMP_TLS_STRUCT
+#define ov_icall_va (g_cpu.icall_va)
+#else
+extern RECOMP_TLS uint32_t nfs_icall_va;
+#define ov_icall_va (nfs_icall_va)
+#endif
+
 /* 0x006F5FC5: Cyrix detection.
  *   xor eax,eax; sahf; mov eax,5; mov ebx,2; div bl; lahf; cmp ah,2; ...
  * Cyrix parts leave the flags untouched across DIV, so AH reads back 2 (the
@@ -123,7 +132,7 @@ static void ov_fx_method(void) {
     /* Hot (~4k calls per frame): method index and lifted target from a small direct-mapped cache. */
     enum { NC = 256 };
     static uint32_t cVa[NC]; static int cIdx[NC]; static recomp_func_t cFn[NC];
-    const uint32_t va = g_cpu.icall_va;
+    const uint32_t va = ov_icall_va;
     const unsigned h = ((va >> 1) ^ (va >> 9)) & (NC - 1);
     if (cVa[h] != va) {
         unsigned i;
