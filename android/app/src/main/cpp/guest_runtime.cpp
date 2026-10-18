@@ -229,9 +229,18 @@ uint32_t read32(uint32_t va);
 // what it was waiting for, dumped when the game stops presenting frames.
 struct GuestThreadTrace {
     std::atomic<uint32_t> func{0},handle{0},esp{0};std::atomic<const char*> wait{nullptr};
-    std::array<std::atomic<uint32_t>,8> held{};  // critical sections this thread owns (outermost entries)
+    std::array<std::atomic<uint32_t>,16> held{};  // critical sections this thread owns (outermost entries)
     void hold(uint32_t cs){for(auto& slot:held){uint32_t empty=0;if(slot.compare_exchange_strong(empty,cs))return;}}
     void release(uint32_t cs){for(auto& slot:held){uint32_t value=cs;if(slot.compare_exchange_strong(value,0))return;}}
+    bool holdsLocks() const {
+        for(const auto& slot:held){if(slot.load(std::memory_order_acquire)!=0)return true;}
+        return false;
+    }
+    bool holds(uint32_t cs) const {
+        if(!cs)return false;
+        for(const auto& slot:held){if(slot.load(std::memory_order_acquire)==cs)return true;}
+        return false;
+    }
 };
 std::mutex threadTracesMutex;
 std::map<uint32_t,std::shared_ptr<GuestThreadTrace>> threadTraces;
@@ -282,6 +291,7 @@ void yieldGuestMachine(unsigned milliseconds=0,std::chrono::steady_clock::time_p
     if(!machineLease||!machineLease->owns_lock())throw GuestStop("Guest scheduler ownership missing");
     // Nothing queued for the machine: a plain yield would only cost an unlock, a syscall and a relock.
     if(!milliseconds&&!machine.hasWaiters())return;
+    if(!milliseconds&&currentTrace().holdsLocks())return;
     {auto& trace=currentTrace();trace.func=g_cur_func;trace.esp=g_esp;}
     State saved;saved.save();machineLease->unlock();
     if(deadline!=std::chrono::steady_clock::time_point{})std::this_thread::sleep_until(deadline);
@@ -334,7 +344,12 @@ void checkGuestProgress() {
         auto now=std::chrono::steady_clock::now();
         if(bootDeadline!=std::chrono::steady_clock::time_point::max()&&now>bootDeadline)throw GuestStop("CRT bring-up time budget reached at "+hex(g_cur_func));
         // Time slicing only matters while threads take turns; parallel guest code holds no machine.
-        if(now>=nextYield&&(!parallelGuest||machine.heldByMe())){if(machine.hasWaiters())yieldGuestMachine();nextYield=std::chrono::steady_clock::now()+std::chrono::microseconds(500);}
+        if(now>=nextYield&&(!parallelGuest||machine.heldByMe())){
+            if(!currentTrace().holdsLocks()){
+                if(machine.hasWaiters())yieldGuestMachine();
+                nextYield=std::chrono::steady_clock::now()+std::chrono::microseconds(500);
+            }
+        }
     }
     if(!guestThreadFault.empty())throw GuestStop(guestThreadFault);
 }
@@ -763,8 +778,53 @@ void testGuestCriticalSections(){
     callGuest(leave,{data});okay=okay&&!criticalSections.count(data)&&!pendingCriticalDeletes.count(data)&&read32(data+8)==0;
     callGuest(initialize,{data});callGuest(remove,{data});okay=okay&&!criticalSections.count(data);
     heaps->free(GuestHeaps::process,data);
+
+    // Deadlock cycle resolution test: Thread 1 holds csA and requests csB; Worker 9001 holds csB and requests csA.
+    uint32_t csA=allocate(32),csB=allocate(32);
+    callGuest(initialize,{csA});callGuest(initialize,{csB});
+    callGuest(enter,{csA});
+    std::atomic<bool> workerHoldsB{false},workerDone{false};
+    std::thread deadlockWorker([&]{
+        std::unique_lock<MachineMutex> lease(machine);machineLease=&lease;guestThreadId=9001;
+        uint32_t workerStack=allocate(64*1024);
+        State fresh;fresh.esp=workerStack+64*1024-64;fresh.load();
+        callGuest(enter,{csB});
+        workerHoldsB=true;
+        notifyGuestSync();
+        callGuest(enter,{csA});
+        callGuest(leave,{csA});
+        callGuest(leave,{csB});
+        heaps->free(GuestHeaps::process,workerStack);
+        forgetThreadTrace();
+        workerDone=true;
+        notifyGuestSync();
+        machineLease=nullptr;
+    });
+    while(!workerHoldsB.load()){checkGuestProgress();waitGuestSync(guestSyncGeneration.load(),5);}
+    while(true){
+        {
+            std::lock_guard<std::mutex> lock(threadTracesMutex);
+            auto it=threadTraces.find(9001);
+            if(it!=threadTraces.end()&&it->second){
+                const char* w=it->second->wait.load();
+                if(w&&!std::strcmp(w,"EnterCriticalSection")&&it->second->handle.load()==csA)break;
+            }
+        }
+        checkGuestProgress();waitGuestSync(guestSyncGeneration.load(),5);
+    }
+    callGuest(enter,{csB});
+    bool deadlockPassed=read32(csA+12)==guestThreadId&&read32(csB+12)==guestThreadId;
+    callGuest(leave,{csB});
+    callGuest(leave,{csA});
+    machineLease->unlock();
+    deadlockWorker.join();
+    machineLease->lock();
+    callGuest(remove,{csA});callGuest(remove,{csB});
+    heaps->free(GuestHeaps::process,csA);heaps->free(GuestHeaps::process,csB);
+    okay=okay&&deadlockPassed&&workerDone.load();
+
     if(!okay)throw GuestStop("Guest critical-section retirement self-check failed");
-    NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSU2","Guest critical sections passed recursion, owner, guards, deferred retirement and reinitialization");
+    NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSU2","Guest critical sections passed recursion, owner, guards, deferred retirement, reinitialization and deadlock resolution");
 }
 thread_local uint32_t dynamicThunkAddress{};
 void generatedTestCallback(){++generatedTestCalls;ret(read32(arg(0)),0);}

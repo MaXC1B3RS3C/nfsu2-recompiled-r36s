@@ -63,6 +63,54 @@ void enterCritical() {
             if(timeIt&&!contended){contended=true;csStart=std::chrono::steady_clock::now();}
             if(reportLongWaits&&!reported&&std::chrono::steady_clock::now()-waitStart>std::chrono::seconds(8)){reported=true;
                 NFS_RUNTIME_LOG(ANDROID_LOG_WARN,"NFSU2","LONG WAIT guest thread %u on critical section %08x owned by guest thread %u (count %u)",guestThreadId,address,read32(address+12),read32(address+8));}
+
+            // Deadlock cycle detection & resolution:
+            uint32_t owner = memory && memory->readable(address + 12, 4) ? read32(address + 12) : 0;
+            if(owner != 0 && owner != guestThreadId) {
+                uint32_t ownerWaitsFor = 0;
+                {
+                    std::lock_guard<std::mutex> lock(threadTracesMutex);
+                    auto it = threadTraces.find(owner);
+                    if(it != threadTraces.end() && it->second) {
+                        const char* wait = it->second->wait.load(std::memory_order_relaxed);
+                        if(wait && !std::strcmp(wait, "EnterCriticalSection")) {
+                            uint32_t w = it->second->handle.load(std::memory_order_relaxed);
+                            if(w != 0 && currentTrace().holds(w)) {
+                                ownerWaitsFor = w;
+                            }
+                        }
+                    }
+                }
+                if(ownerWaitsFor != 0) {
+                    NFS_RUNTIME_LOG(ANDROID_LOG_WARN, "NFSU2",
+                        "Deadlock cycle detected: thread %u holds %08x wanting %08x; thread %u holds %08x wanting %08x. Resolving by yielding %08x.",
+                        guestThreadId, ownerWaitsFor, address, owner, address, ownerWaitsFor, ownerWaitsFor);
+                    auto heldMutex = findCritical(ownerWaitsFor);
+                    if(heldMutex) {
+                        uint32_t savedCount = memory && memory->readable(ownerWaitsFor + 8, 4) ? read32(ownerWaitsFor + 8) : 1;
+                        if(savedCount == 0) savedCount = 1;
+                        write32(ownerWaitsFor + 8, 0);
+                        write32(ownerWaitsFor + 4, UINT32_MAX);
+                        write32(ownerWaitsFor + 12, 0);
+                        currentTrace().release(ownerWaitsFor);
+                        for(uint32_t i = 0; i < savedCount; ++i) heldMutex->unlock();
+                        notifyGuestSync();
+
+                        while(!mutex->try_lock()) {
+                            checkGuestProgress();
+                            waitGuestSync(guestSyncGeneration.load(), 2, [&]{ return read32(address + 8) == 0; });
+                        }
+
+                        for(uint32_t i = 0; i < savedCount; ++i) heldMutex->lock();
+                        write32(ownerWaitsFor + 8, savedCount);
+                        write32(ownerWaitsFor + 4, savedCount - 1);
+                        write32(ownerWaitsFor + 12, guestThreadId);
+                        currentTrace().hold(ownerWaitsFor);
+                        break;
+                    }
+                }
+            }
+
             checkGuestProgress();waitGuestSync(gen,4,[&]{return read32(address+8)==0;});}
     }
     if(findCritical(address)!=mutex){mutex->unlock();throw GuestStop("Critical section deleted while waiting");}
