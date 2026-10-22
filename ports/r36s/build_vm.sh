@@ -40,7 +40,7 @@ MOJO="$ROOT/third_party/mojoshader"
 SDLI="-I$OUT/sdk/include -I$OUT/sdk/include/SDL2"
 MOJODEF="-DSUPPORT_PROFILE_ARB1=0 -DSUPPORT_PROFILE_ARB1_NV=0 -DSUPPORT_PROFILE_HLSL=0 -DSUPPORT_PROFILE_METAL=0 -DSUPPORT_PROFILE_D3D=0 -DSUPPORT_PROFILE_BYTECODE=0 -DSUPPORT_PROFILE_SPIRV=0 -DSUPPORT_PROFILE_GLSPIRV=0 -DMOJOSHADER_DEPTH_CLIPPING -DMOJOSHADER_FLIP_RENDERTARGET"
 GLESINC="-I$ROOT/ports/r36s/d3d9_gles -I$MOJO -I$DXVK -I$DXVK/windows -I$DXVK/directx $SDLI"
-APPINC="-I$ROOT/ports/r36s -I$ROOT/ports/r36s/d3d9_gles -I$ROOT/android/app/src/main/cpp -I$ROOT/src/runtime -I$ROOT/src/platform -I$PCRECOMP/runtime/recomp32 -I$PCRECOMP/runtime/win32hle $SDLI -isystem $DXVK -isystem $DXVK/windows -isystem $DXVK/directx"
+APPINC="-I$ROOT/build/dxvk-source/include -I$ROOT/ports/r36s -I$ROOT/ports/r36s/d3d9_gles -I$ROOT/android/app/src/main/cpp -I$ROOT/src/runtime -I$ROOT/src/platform -I$PCRECOMP/runtime/recomp32 -I$PCRECOMP/runtime/win32hle $SDLI -isystem $DXVK -isystem $DXVK/windows -isystem $DXVK/directx"
 APPDEF="-DRECOMP_TLS=__thread -DRECOMP_TLS_STRUCT -DNFS_PARALLEL_GUEST -DNFS_FIXED_GUEST_BASE=0x1000000000ULL -DNFS_R36S -DNFS_GLES -DNFS_D3D9_BACKEND -DNFS_SDL_AUDIO -DRECOMP_STRICT_ICALL -DRECOMP_X87_WINDOW $MOJODEF"
 OPT="-O2 -g -DNDEBUG -fno-strict-aliasing -ffp-contract=off"
 
@@ -64,13 +64,30 @@ compile "$ROOT/src/runtime/fx_cache.c" "$OUT/obj/fx_cache.o" gcc $OPT $APPDEF $A
 compile "$ROOT/src/runtime/hud_half.c" "$OUT/obj/hud_half.o" gcc $OPT $APPDEF $APPINC & pids+=($!)
 compile "$ROOT/src/runtime/world_cull.c" "$OUT/obj/world_cull.o" gcc $OPT $APPDEF $APPINC & pids+=($!)
 compile "$ROOT/src/runtime/native_math.c" "$OUT/obj/native_math.o" gcc $OPT $APPDEF $APPINC & pids+=($!)
+compile "$ROOT/src/runtime/native_scene.c" "$OUT/obj/native_scene.o" gcc $OPT $APPDEF $APPINC & pids+=($!)
 compile "$ROOT/src/runtime/widescreen.c" "$OUT/obj/widescreen.o" gcc $OPT $APPDEF $APPINC & pids+=($!)
 fail=0; for p in "${pids[@]}"; do wait "$p" || fail=1; done
 [ "$fail" = 0 ] || { echo "compile failed"; exit 1; }
 
+# glibc compatibility (default on): the binary must start on ArkOS 2.0 (glibc ~2.30) as well as on newer
+# systems, but this box has glibc 2.35 and would otherwise import symbol versions up to GLIBC_2.34 and
+# GLIBCXX_3.4.30. compat/ pins the old symbol versions, picks faster newer libm functions at startup, and
+# replaces crt1.o; libstdc++/libgcc are linked statically. libpthread/libdl/librt stay in NEEDED because on
+# glibc < 2.34 the pinned GLIBC_2.17 functions live there. GLIBC_COMPAT=0 gives the plain link.
+LINKCOMPAT=""
+if [ "${GLIBC_COMPAT:-1}" = 1 ]; then
+  CDIR="$OUT/compat"; mkdir -p "$CDIR"
+  gcc -O2 -fno-builtin -fno-stack-protector -c "$ROOT/ports/r36s/compat/glibc_compat.c" -o "$CDIR/glibc_compat.o"
+  gcc -c "$ROOT/ports/r36s/compat/compat_start.S" -o "$CDIR/compat_start.o"
+  gcc -dumpspecs | awk '/^\*startfile:/{f=1;print;next} /^\*/{f=0} f&&NF' \
+    | sed -E "s#([[:space:]]):crt1.o%s#\1:$CDIR/compat_start.o#" > "$CDIR/compat.specs"
+  grep -q "compat_start.o" "$CDIR/compat.specs" || { echo "ERROR: could not build compat.specs"; exit 1; }
+  LINKCOMPAT="-specs=$CDIR/compat.specs -static-libstdc++ -static-libgcc $CDIR/glibc_compat.o -Wl,--push-state,--no-as-needed -l:libpthread.so.0 -l:libdl.so.2 -l:librt.so.1 -Wl,--pop-state"
+fi
+
 echo "  LD nfsu2.aarch64"
 GUEST_DIR="${GUEST_DIR:-$OUT/guest}"
-g++ -o "$OUT/nfsu2.aarch64" "$OUT"/obj/*.o "$GUEST_DIR"/*.o -L"$GLSHIM" -lSDL2 -lGLESv2 -lpthread -ldl -lm -rdynamic -no-pie $LDEXTRA
+g++ -o "$OUT/nfsu2.aarch64" "$OUT"/obj/*.o "$GUEST_DIR"/*.o -L"$GLSHIM" -lSDL2 -lGLESv2 -lpthread -ldl -lm -rdynamic -no-pie $LINKCOMPAT $LDEXTRA
 echo "built $OUT/nfsu2.aarch64"
 
 # PACKAGE=1: also link a device build for the PortMaster package. The VM has no real libGLESv2, and the
@@ -83,10 +100,16 @@ if [ -n "$PACKAGE" ]; then
   nm -u "$OUT"/obj/*.o | awk '{print $2}' | grep -E '^gl[A-Z]' | sort -u | sed 's/.*/void &(void){}/' > "$STUB/stub.c"
   gcc -shared -fPIC -o "$STUB/libGLESv2.so" -Wl,-soname,libGLESv2.so.2 "$STUB/stub.c"
   echo "  LD package/nfsu2.aarch64 (GLESv2 stub)"
-  g++ -o "$OUT/package/nfsu2.aarch64" "$OUT"/obj/*.o "$GUEST_DIR"/*.o -L"$STUB" -L"$GLSHIM" -lSDL2 -lGLESv2 -lpthread -ldl -lm -rdynamic -no-pie
+  g++ -o "$OUT/package/nfsu2.aarch64" "$OUT"/obj/*.o "$GUEST_DIR"/*.o -L"$STUB" -L"$GLSHIM" -lSDL2 -lGLESv2 -lpthread -ldl -lm -rdynamic -no-pie $LINKCOMPAT
   cp "$OUT/package/nfsu2.aarch64" "$OUT/package/nfsu2.aarch64.debug"  # symbols for device profiles (same layout)
   strip --strip-debug "$OUT/package/nfsu2.aarch64"
   objdump -p "$OUT/package/nfsu2.aarch64" | grep NEEDED
+  if [ "${GLIBC_COMPAT:-1}" = 1 ]; then
+    # newest glibc version the binary imports must stay <= 2.28 (ArkOS 2.0 is ~2.30), nothing from GLIBCXX/CXXABI
+    BADV=$(readelf --dyn-syms -W "$OUT/package/nfsu2.aarch64" | awk '$7=="UND"{print $8}' | grep -oE '@(GLIBC_2\.(29|[3-9][0-9])|GLIBCXX|CXXABI)[A-Za-z0-9_.]*' | sort -u | tr '\n' ' ')
+    [ -z "$BADV" ] || { echo "ERROR: package imports too-new symbol versions: $BADV"; exit 1; }
+    echo "glibc compat OK: max imported version $(readelf --dyn-syms -W "$OUT/package/nfsu2.aarch64" | awk '$7=="UND"{print $8}' | grep -oE 'GLIBC_[0-9.]+' | sort -u -V | tail -1)"
+  fi
   if objdump -p "$OUT/package/nfsu2.aarch64" | grep -q 'NEEDED.*libGL\.so'; then echo "ERROR: links libGL.so"; exit 1; fi
   PKG="$ROOT/ports/r36s/package/nfsu2.aarch64"
   [ -f "$PKG" ] && [ ! -f "$ROOT/build/r36s-vm/nfsu2.aarch64.package-prev" ] && cp -p "$PKG" "$ROOT/build/r36s-vm/nfsu2.aarch64.package-prev"

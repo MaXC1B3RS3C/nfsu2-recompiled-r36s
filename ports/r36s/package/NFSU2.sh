@@ -96,7 +96,7 @@ if [ -z "$SWAP_TOTAL" ] || [ "$SWAP_TOTAL" -lt 256 ]; then
     dd if=/dev/zero of="$GAMEDIR/.swapfile" bs=1M count=512 status=none
     mkswap "$GAMEDIR/.swapfile" >/dev/null 2>&1
   fi
-  sudo swapon "$GAMEDIR/.swapfile" >/dev/null 2>&1
+  sudo swapon "$GAMEDIR/.swapfile" >/dev/null 2>&1 && SWAP_ADDED=1
 fi
 
 # Verify game assets presence
@@ -221,6 +221,14 @@ CAP_ARG="--cap60"; [ "$NFSU2_FPS" = "30" ] && CAP_ARG="--cap30"
 LANG_ARG="--lang=$NFSU2_LANG"
 ./nfsu2.aarch64 "$GAMEDIR/gamedata" $CAP_ARG $LANG_ARG > "$GAMEDIR/log.txt" 2>&1
 EXIT_CODE=$?
+
+# Get everything onto the card before the console returns to the menu (people often switch off right
+# after quitting): pending writes first, then the swap file this launcher enabled on the card.
+sync
+if [ -n "$SWAP_ADDED" ]; then
+  sudo swapoff "$GAMEDIR/.swapfile" >/dev/null 2>&1
+  sync
+fi
 
 # Restore console and services on exit
 echo 1 | sudo tee /sys/class/vtconsole/vtcon0/bind > /dev/null 2>&1 || true

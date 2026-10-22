@@ -6,6 +6,7 @@
 #   GUEST_CFLAGS   default "-O2 -mcpu=cortex-a35 -fno-pie -DNFS_FIXED_GUEST_BASE=...": in-order scheduling,
 #                  direct (non-GOT) globals and a constant guest base (see arm64_guest.h)
 #   BUDGET         seconds to keep starting compiles (default 60)
+#   GUEST_CC       compiler (default gcc; pgo_clang_vm.sh passes clang)
 # Files over 8 MB are split at function boundaries (scripts/split_android_sources.py, as the CMake build
 # does for the largest one) so no single compile outlasts a call.
 set -e
@@ -14,6 +15,7 @@ PCRECOMP="${PCRECOMP:-$ROOT/../pcrecomp}"
 GUEST_OUT="${GUEST_OUT:-$HOME/nfsvm/guest-v10}"
 GUEST_CFLAGS="${GUEST_CFLAGS:--O2 -mcpu=cortex-a35 -fno-pie -DNFS_FIXED_GUEST_BASE=0x1000000000ULL -DRECOMP_TLS=__thread -DRECOMP_TLS_STRUCT -ftls-model=local-exec -fno-math-errno -fno-stack-clash-protection -fno-stack-protector -DNFS_X87_LOCAL -DNFS_X87_LW}"
 BUDGET="${BUDGET:-30}"
+GUEST_CC="${GUEST_CC:-gcc}"
 JOBS="${JOBS:-4}"
 SPLIT="${GUEST_OUT}-split"
 mkdir -p "$GUEST_OUT" "$SPLIT"
@@ -24,7 +26,7 @@ FLAGS="$GUEST_CFLAGS -w -fwrapv -fno-strict-aliasing -fexceptions -ffp-contract=
 STAMP="$GUEST_OUT/.flags"
 # The stamp ignores where the checkout is mounted (the same folder is reachable as ~/mnt/Projects/... and
 # ~/mnt/nfsu2-recompiled in the VM): a different path once wiped every object. Run from ~/mnt/Projects/....
-STAMPED="${FLAGS//$ROOT/ROOT}"; STAMPED="${STAMPED//$PCRECOMP/PCRECOMP}"
+STAMPED="${FLAGS//$ROOT/ROOT}"; [ "$GUEST_CC" = gcc ] || STAMPED="$GUEST_CC $STAMPED"; STAMPED="${STAMPED//$PCRECOMP/PCRECOMP}"
 [ -d "$PCRECOMP/runtime/recomp32" ] || { echo "ERROR: $PCRECOMP not found (run from ~/mnt/Projects/nfsu2-recompiled)"; exit 1; }
 if [ "$(cat "$STAMP" 2>/dev/null)" != "$STAMPED" ]; then rm -f "$GUEST_OUT"/*.o; echo "$STAMPED" > "$STAMP"; fi
 SRCS=()
@@ -57,18 +59,19 @@ for src in "${SRCS[@]}"; do
   case "$(basename "$src")" in recomp_0039.c) F="$F -Dsub_00664743=sub_00664743_orig";; esac
   # Wrapped functions whose callers are in their own file: only the definition is renamed *_orig, in a
   # copy of the source (the callers then reach the native wrapper). fx_cache.c / hud_half.c / world_cull.c /
-  # native_math.c.
+  # native_math.c / native_scene.c.
   cc_src="$src"; wrap=""
   case "$(basename "$src")" in
     recomp_0040.c) wrap="sub_00668FAA sub_006689E4 sub_00668EC5";;
     recomp_0021.c) wrap="sub_005361B0";;
-    recomp_0029.c) wrap="sub_005CF150 sub_005D3080 sub_005BF2E0";;  # sub_005BF2E0: GetRacingResolution (guest_runtime.cpp)
+    recomp_0029.c) wrap="sub_005CF150 sub_005D3080 sub_005BF2E0 sub_005C5600 sub_005CE860";;  # sub_005BF2E0: GetRacingResolution (guest_runtime.cpp); the last two: native_scene.c
     recomp_0057.c) wrap="sub_0075BC00";;
     recomp_0000.c) wrap="sub_00401310 sub_00401430";;
     recomp_0042_part_001.c) wrap="sub_00689A17";;
-    recomp_0004.c) wrap="sub_00440FF0 sub_0043CA20 sub_0043D250 sub_0043CA30";;
+    recomp_0004.c) wrap="sub_00440FF0 sub_0043CA20 sub_0043D250 sub_0043CA30 sub_00440EA0";;  # sub_00440EA0: native_scene.c
     recomp_0003.c) wrap="sub_0043C310 sub_0043C3B0 sub_0043BE50";;
     recomp_0024.c) wrap="sub_00576170";;
+    recomp_0030.c) wrap="sub_005D6700 sub_005D62C0";;  # native_scene.c
     recomp_0028.c) wrap="sub_005BBF20 sub_005BC010";;
   esac
   if [ -n "$wrap" ]; then
@@ -79,7 +82,7 @@ for src in "${SRCS[@]}"; do
       grep -q "^void ${w}_orig(void) {\$" "$cc_src" || { echo "ERROR: $w definition not found"; exit 1; }
     done
   fi
-  ( gcc -c "$cc_src" -o "$obj.tmp" $F && mv "$obj.tmp" "$obj" && echo "  CC $(basename "$src")" ) &
+  ( $GUEST_CC -c "$cc_src" -o "$obj.tmp" $F && mv "$obj.tmp" "$obj" && echo "  CC $(basename "$src")" ) &
 done
 wait
 left=0

@@ -3,6 +3,7 @@
 
 #include <cstdio>
 extern "C" void __gcov_dump(void) __attribute__((weak));  // libgcov, -fprofile-generate builds only
+extern "C" int __llvm_profile_write_file(void) __attribute__((weak));  // clang profile runtime (pgo_clang_vm.sh gen)
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -28,6 +29,7 @@ extern "C" void __gcov_dump(void) __attribute__((weak));  // libgcov, -fprofile-
 #endif
 
 #include <csignal>
+#include <unistd.h>
 
 extern uint32_t g_nfsScreenRotation;  // d3d9_gles.cpp
 bool toggleD3D9FpsCounter();           // d3d9_gles.cpp
@@ -243,6 +245,7 @@ static bool vkbdHandleAxis(uint8_t axis, float value) {
 
 static void signalHandler(int sig) {
     std::printf("[NFSU2] Caught signal %d, exiting immediately.\n", sig);
+    ::sync();   // killed from the system/PortMaster: get pending writes (saves, logs) onto the card first
     std::_Exit(0);
 }
 
@@ -425,6 +428,12 @@ int main(int argc, char** argv) {
     }
     chooseResolution(config);
     g_nfsScreenRotation = config.rotation;
+    {
+        // set by ports/r36s/compat/glibc_compat.c (absent in builds linked without it)
+        extern int compat_newer_libm __attribute__((weak));
+        if (&compat_newer_libm)
+            std::printf("[NFSU2] glibc compat: %s libm functions\n", compat_newer_libm ? "newer" : "GLIBC_2.17");
+    }
     std::printf("[NFSU2] screen %ux%u%s, game renders %ux%u (%s)\n", config.screenWidth, config.screenHeight,
                 config.rotation == 90 ? " rotated 90" : (config.rotation == 270 ? " rotated 270" : ""),
                 config.targetWidth, config.targetHeight,
@@ -548,7 +557,44 @@ int main(int argc, char** argv) {
         }
         auto frameStart = std::chrono::steady_clock::now();
 
-        if (config.autoAdvance) {
+        // NFSU2_KEY_SCRIPT="start;frame:key[:frames],..." (smoke tests): from frame `start` on, the automatic menu
+        // navigation stops and only these key taps reach the game (key: enter esc up down left right space tab,
+        // or a hex DIK scan code; held for `frames`, default 4).
+        static const char* keyScript = std::getenv("NFSU2_KEY_SCRIPT");
+        static uint32_t keyScriptStart = keyScript ? static_cast<uint32_t>(std::atoi(keyScript)) : 0;
+        if (keyScript && getD3D9PresentCount() >= keyScriptStart) {
+            struct Tap { uint32_t frame, scan, len; };
+            static std::vector<Tap> taps = [] {
+                std::vector<Tap> v;
+                const char* p = std::strchr(keyScript, ';');
+                std::string all = p ? p + 1 : "";
+                size_t pos = 0;
+                while (pos < all.size()) {
+                    size_t end = all.find(',', pos); if (end == std::string::npos) end = all.size();
+                    std::string item = all.substr(pos, end - pos); pos = end + 1;
+                    unsigned f = 0, len = 4; char name[16] = {};
+                    if (std::sscanf(item.c_str(), "%u:%15[^:]:%u", &f, name, &len) < 2) continue;
+                    const std::string n = name;
+                    uint32_t scan = n == "enter" ? 0x1c : n == "esc" ? 0x01 : n == "up" ? 0xc8 : n == "down" ? 0xd0 :
+                                    n == "left" ? 0xcb : n == "right" ? 0xcd : n == "space" ? 0x39 : n == "tab" ? 0x0f :
+                                    static_cast<uint32_t>(std::strtoul(name, nullptr, 16));
+                    v.push_back({f, scan, len});
+                }
+                std::printf("[NFSU2] key script: %zu taps from frame %u\n", v.size(), keyScriptStart);
+                return v;
+            }();
+            static bool released = false;
+            if (!released) {   // let go of whatever the automatic navigation was holding
+                for (unsigned sc : {0x1cu, 0x39u, 0x01u, 0xcbu}) setGuestKey(sc, false);
+                g_pad.buttons = 0; g_pad.hatX = g_pad.hatY = 0; syncPadToGuest();
+                released = true;
+            }
+            const uint32_t fr = getD3D9PresentCount();
+            for (const Tap& t : taps) {
+                if (fr == t.frame) { setGuestKey(t.scan, true); std::printf("[NFSU2] key script %u: %02x down\n", fr, t.scan); }
+                if (fr == t.frame + t.len) setGuestKey(t.scan, false);
+            }
+        } else if (config.autoAdvance) {
             // Profile name: erase the default "NOMBRE" and type "R36s" (Shift+R tests capitals through
             // TranslateMessage; the field holds 7 characters).
             struct ScriptKey { unsigned frame, scan; bool down; };
@@ -644,16 +690,6 @@ int main(int argc, char** argv) {
             }
             // NFSU2_AUTODRIVE=<frame>: from that frame hold the throttle and weave a little, so smoke runs see a
             // moving camera (the race starts ~2400 frames into an --auto-advance run).
-            // NFSU2_GCOV_DUMP=<frame>: write the profile counters of a -fprofile-generate build at that frame
-            // (smoke runs end with SIGKILL, so the exit-time dump never happens). PGO, see build_guest_vm.sh.
-            {
-                static const int gcovFrame = getenv("NFSU2_GCOV_DUMP") ? atoi(getenv("NFSU2_GCOV_DUMP")) : 0;
-                if (gcovFrame && frames == (uint32_t)gcovFrame && __gcov_dump) {
-                    std::printf("[NFSU2] writing profile counters (frame %u)\n", frames); std::fflush(stdout);
-                    __gcov_dump();
-                    std::printf("[NFSU2] profile counters written\n"); std::fflush(stdout);
-                }
-            }
             static const int autoDrive = getenv("NFSU2_AUTODRIVE") ? atoi(getenv("NFSU2_AUTODRIVE")) : 0;
             if (autoDrive && frames >= (uint32_t)autoDrive) {
                 setGuestKey(0xc8, true);
@@ -663,8 +699,32 @@ int main(int argc, char** argv) {
             }
         }
 
+        // NFSU2_GCOV_DUMP=<frame>: write the profile counters of a -fprofile-generate build (GCC or clang) at that
+        // frame (smoke runs end with SIGKILL, so the exit-time dump never happens). pgo_vm.sh, pgo_clang_vm.sh.
+        // Outside the automatic navigation, so key-script runs (driving) can be profiled too.
+        {
+            static const uint32_t gcovFrame = getenv("NFSU2_GCOV_DUMP") ? static_cast<uint32_t>(atoi(getenv("NFSU2_GCOV_DUMP"))) : 0;
+            static bool written = false;
+            if (gcovFrame && !written && getD3D9PresentCount() >= gcovFrame && (__gcov_dump || __llvm_profile_write_file)) {
+                written = true;
+                std::printf("[NFSU2] writing profile counters (frame %u)\n", getD3D9PresentCount()); std::fflush(stdout);
+                if (__gcov_dump) __gcov_dump();
+                if (__llvm_profile_write_file) __llvm_profile_write_file();
+                std::printf("[NFSU2] profile counters written\n"); std::fflush(stdout);
+            }
+        }
+
         // NFSU2_TEST_COMBO=1 (smoke tests): Select+R3 at frame 2300, a Select tap at 2350, a long Select at 2400.
         static const bool testCombo = std::getenv("NFSU2_TEST_COMBO") != nullptr;
+        // NFSU2_TEST_QUIT=<frame> (smoke tests): Select + Start at that frame.
+        static const uint32_t testQuit = std::getenv("NFSU2_TEST_QUIT") ? std::atoi(std::getenv("NFSU2_TEST_QUIT")) : 0;
+        if (testQuit) {
+            static int step = 0;
+            const uint32_t f = getD3D9PresentCount();
+            auto push = [](uint8_t b) { SDL_Event e{}; e.type = SDL_CONTROLLERBUTTONDOWN; e.cbutton.button = b; e.cbutton.state = SDL_PRESSED; SDL_PushEvent(&e); };
+            if (step == 0 && f >= testQuit) { push(SDL_CONTROLLER_BUTTON_BACK); step = 1; }
+            else if (step == 1 && f >= testQuit + 2) { push(SDL_CONTROLLER_BUTTON_START); step = 2; }
+        }
         if (testCombo) {
             static uint32_t lastFrame = 0;
             const uint32_t f = getD3D9PresentCount();
@@ -770,6 +830,14 @@ int main(int argc, char** argv) {
     }
 
     std::printf("[NFSU2] Shutting down...\n");
+    quiesceGuestFilesForExit(3000);
+    // Saves are closed and the card is synced. Tearing down the guest threads, the render thread and the
+    // display from here sometimes crashed or hung (players then cut the power: card damage), and nothing
+    // is left to write, so end the process now: the kernel releases the display, audio and files.
+    if (!std::getenv("NFSU2_FULL_SHUTDOWN")) {
+        std::printf("[NFSU2] Clean exit.\n");
+        std::_Exit(0);
+    }
     requestGuestRuntimeStop();
     shutdownD3D9Bridge();
 
@@ -782,5 +850,6 @@ int main(int argc, char** argv) {
     SDL_Quit();
 
     std::printf("[NFSU2] Clean exit.\n");
+    ::sync();
     std::_Exit(0);
 }
