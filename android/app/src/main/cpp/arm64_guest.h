@@ -24,7 +24,7 @@ extern int nfs_android_resolution(void);
 #endif
 #define RECOMP_ENTER(va) do { \
     NFS_SET_CUR_FUNC(va); RECOMP_FLAGS_IN(); \
-    if((va)==0x005BF610u){ \
+    if((va)==0x005BF2E0u){ \
         RECOMP_REGS_OUT(); \
         if(nfs_android_resolution()){RECOMP_REGS_IN();return;} \
         RECOMP_REGS_IN(); \
@@ -253,7 +253,7 @@ static inline __attribute__((always_inline)) uint64_t nfs_dbits(double v) { uint
         for (int _k = 0; _k < l_lwk; ++_k) { l_lw[NFS_LWB + _k] = l_lws[_k] = l_stw[l_g0 + _k]; l_lwi[NFS_LWB + _k] = l_lwis[_k] = l_sti[l_g0 + _k]; } } \
     do { \
         NFS_SET_CUR_FUNC(va); RECOMP_FLAGS_IN(); \
-        if((va)==0x005BF610u){ \
+        if((va)==0x005BF2E0u){ \
             RECOMP_REGS_OUT(); \
             if(nfs_android_resolution()){RECOMP_REGS_IN();return;} \
             RECOMP_REGS_IN(); \

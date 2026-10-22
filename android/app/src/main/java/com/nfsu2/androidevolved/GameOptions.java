@@ -20,10 +20,13 @@ final class GameOptions {
         }
     }
 
-    static final String RESOLUTION = "resolution", FPS = "fps", WIDESCREEN = "widescreen", LATENCY = "latency",
+    static final String RENDERER = "renderer", RESOLUTION = "resolution", FPS = "fps", WIDESCREEN = "widescreen", LATENCY = "latency",
             TEXTURES = "textures", MINIMAP = "minimap", LANGUAGE = "language";
 
     static final Option[] ALL = {
+            new Option(RENDERER, "Motor gráfico", "gles",
+                    new String[] {"gles", "vulkan"},
+                    new String[] {"OpenGL ES (Compatible / Consolas)", "Vulkan (DXVK)"}),
             new Option(RESOLUTION, "Resolución interna", "75",
                     new String[] {"100", "75", "50", "720"},
                     new String[] {"Nativa · máxima calidad", "75% · equilibrada", "50% · máximo rendimiento",

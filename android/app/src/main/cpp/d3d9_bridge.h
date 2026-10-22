@@ -1,6 +1,6 @@
 #pragma once
 #include <cstdint>
-#if defined(NFS_R36S) || defined(NFS_GLES)
+#if (defined(NFS_R36S) || defined(NFS_GLES)) && !defined(__ANDROID__)
 typedef void ANativeWindow;
 #else
 struct ANativeWindow;
@@ -9,6 +9,8 @@ void configureD3D9Bridge(void* guestBase,uint32_t (*allocator)(uint32_t),void (*
 void shutdownD3D9Bridge();
 void setD3D9HostWindow(ANativeWindow* window);
 void setD3D9RenderSize(unsigned width,unsigned height);
+void setD3D9Renderer(const char* renderer);
+bool isD3D9Gles();
 // Launcher compatibility options; call before the game creates its device.
 void setD3D9Compatibility(bool cpuTextures,unsigned backBuffers);
 bool d3d9RequestsSurface();
