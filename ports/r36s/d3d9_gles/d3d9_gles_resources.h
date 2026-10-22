@@ -9,6 +9,7 @@
 // Set by the D3D9 bridge (android/.../d3d9_render_thread.inc) while it creates a vertex/index buffer on the
 // game thread: the GL buffer is then created on first use on the render thread (ensureGL).
 extern thread_local bool g_glesDeferBufferGL;
+extern thread_local bool g_glesDeferTextureGL;   // 2D textures created off the render thread: GL storage on first use
 
 namespace d3d9_gles {
 
@@ -120,8 +121,35 @@ struct GLTextureObject {
     UINT width = 0, height = 0;
     bool rgb565 = false, formatDecided = false;
     int64_t* glBytes = nullptr;
+    // Textures created off the render thread (the bridge's async CreateTexture) get their GL name and storage
+    // on first use, on the render thread, in the format decided by then: an opaque DXT texture is allocated
+    // as RGB565 once, instead of an RGBA8 chain that its first upload re-specifies.
+    bool storagePending = false;
+
+    // The GL texture name; creates the storage of a texture made off the render thread.
+    GLuint name() const {
+        if (storagePending) const_cast<GLTextureObject*>(this)->createStorage();
+        return tex;
+    }
+    void createStorage() {  // 2D textures only (cube textures are never deferred)
+        storagePending = false;
+        glGenTextures(1, &tex);
+        glBindTexture(GL_TEXTURE_2D, tex);
+        const GLenum format = rgb565 ? GL_RGB : GL_RGBA, type = rgb565 ? GL_UNSIGNED_SHORT_5_6_5 : GL_UNSIGNED_BYTE;
+        const int64_t bytesPerTexel = rgb565 ? 2 : 4;
+        int64_t bytes = 0;
+        UINT w = width, h = height;
+        for (UINT level = 0; level < glLevels; ++level) {
+            glTexImage2D(GL_TEXTURE_2D, level, format, std::max(w, 1u), std::max(h, 1u), 0, format, type, nullptr);
+            bytes += static_cast<int64_t>(std::max(w, 1u)) * std::max(h, 1u) * bytesPerTexel;
+            w >>= 1; h >>= 1;
+        }
+        if (glBytes) *glBytes += bytes;
+        g_texGLBytes += bytes;
+    }
 
     void respecifyAs565() {
+        if (storagePending) { rgb565 = true; return; }   /* allocated as RGB565 directly on first use */
         rgb565 = true;
         glBindTexture(target, tex);
         const int faces = target == GL_TEXTURE_CUBE_MAP ? 6 : 1;
@@ -145,7 +173,7 @@ struct GLTextureObject {
         // regenerating on each level-0 upload is wasted work (and then overwritten).
         if (level != 0 || !mipmapped() || renderTarget || d3dLevels >= glLevels) return;
         if (target == GL_TEXTURE_2D) {
-            glBindTexture(GL_TEXTURE_2D, tex);
+            glBindTexture(GL_TEXTURE_2D, name());
             glsc::DriverCpuTimer timer;
             glGenerateMipmap(GL_TEXTURE_2D);
         } else {
@@ -178,7 +206,7 @@ public:
         const bool isDepth = (format == D3DFMT_D24S8 || format == D3DFMT_D16 || format == D3DFMT_D24X8 ||
                               format == D3DFMT_D24FS8 || format == D3DFMT_D32 || format == D3DFMT_D15S1 ||
                               format == D3DFMT_D24X4S4);
-        if (!glTexture && isDepth) {
+        if (!glTexture && !owner && isDepth) {   // a plain depth surface (a texture level's GL texture may be deferred)
             glGenRenderbuffers(1, &m_glRenderbuffer);
             glBindRenderbuffer(GL_RENDERBUFFER, m_glRenderbuffer);
             if (glesCaps().depth24Stencil8) {
@@ -244,7 +272,7 @@ public:
         if (m_cpuBuffer.empty()) {
             m_cpuBuffer.resize(static_cast<size_t>(m_width) * m_height * m_bpp, 0);
             g_texShadowBytes += static_cast<int64_t>(m_cpuBuffer.capacity());
-            if (m_glTexture && m_uploaded) {
+            if (isTextureLevel() && m_uploaded) {
                 ++g_texRelocks;
                 m_keepShadow = true;
                 if (!(Flags & D3DLOCK_DISCARD) && !readBack()) ++g_texReadbackFails;
@@ -260,7 +288,7 @@ public:
     }
 
     STDMETHOD(UnlockRect)() override {
-        if (!m_glTexture) return D3D_OK;
+        if (!isTextureLevel()) return D3D_OK;
         if (!m_readOnlyLock) {
             HitchTimer hitch(2);
             m_upload.resize(static_cast<size_t>(m_width) * m_height * 4);
@@ -275,7 +303,7 @@ public:
                 for (size_t i = 0; opaque && i < texels; ++i) opaque = m_upload[i * 4 + 3] == 255;
                 if (opaque) m_owner->respecifyAs565();
             }
-            glBindTexture(m_owner ? m_owner->target : m_target, m_glTexture);
+            glBindTexture(m_owner ? m_owner->target : m_target, glTexture());   // after the format decision above
             if (m_owner && m_owner->rgb565) {
                 // In place: RGBA8 -> RGB565 into the front half of the same buffer.
                 uint16_t* out = reinterpret_cast<uint16_t*>(m_upload.data());
@@ -307,7 +335,7 @@ public:
         static GLuint fbo = 0;
         if (!fbo) glGenFramebuffers(1, &fbo);
         glBindFramebuffer(GL_FRAMEBUFFER, fbo);
-        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, m_target, m_glTexture, static_cast<GLint>(m_level));
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, m_target, glTexture(), static_cast<GLint>(m_level));
         const bool ok = glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
         if (ok) {
             glPixelStorei(GL_PACK_ALIGNMENT, 4);
@@ -324,7 +352,9 @@ public:
     STDMETHOD(GetDC)(HDC* phdc) override { return E_NOTIMPL; }
     STDMETHOD(ReleaseDC)(HDC hdc) override { return E_NOTIMPL; }
 
-    GLuint getGLTexture() const { return m_glTexture; }
+    GLuint getGLTexture() const { return glTexture(); }
+    // The level was uploaded without going through LockRect/UnlockRect (IDirect3DTexture9GLES::uploadDecodedLevel).
+    void markUploaded() { m_uploaded = true; }
     UINT getWidth() const { return m_width; }
     UINT getHeight() const { return m_height; }
     GLenum getTarget() const { return m_target; }
@@ -336,6 +366,10 @@ public:
     GLTextureObject* getOwner() const { return m_owner; }
 
 private:
+    // A level of a GL texture (its owner's, created on first use when deferred), or a plain surface (0).
+    bool isTextureLevel() const { return m_owner != nullptr || m_glTexture != 0; }
+    GLuint glTexture() const { return m_owner ? m_owner->name() : m_glTexture; }
+
     UINT m_width;
     UINT m_height;
     D3DFORMAT m_format;
@@ -368,23 +402,16 @@ public:
         m_obj.d3dLevels = (usage & D3DUSAGE_AUTOGENMIPMAP) ? 1 : numLevels;  // autogen: D3D exposes 1 level
         m_obj.pot = ((width & (width - 1)) == 0) && ((height & (height - 1)) == 0);
         m_obj.renderTarget = (usage & D3DUSAGE_RENDERTARGET) != 0;
-        glGenTextures(1, &m_obj.tex);
-        glBindTexture(GL_TEXTURE_2D, m_obj.tex);
         // Allocate the complete GL chain whenever mipmaps are in use so the texture is always complete.
         const UINT glLevels = m_obj.mipmapped() ? full : 1;
         m_obj.glLevels = glLevels;
         m_obj.width = width;
         m_obj.height = height;
         m_obj.glBytes = &m_glBytes;
-        UINT w = width, h = height;
-        for (UINT i = 0; i < glLevels; ++i) {
-            glTexImage2D(GL_TEXTURE_2D, i, GL_RGBA, std::max(w, 1u), std::max(h, 1u), 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
-            m_glBytes += static_cast<int64_t>(std::max(w, 1u)) * std::max(h, 1u) * 4;
-            w >>= 1; h >>= 1;
-        }
-        g_texGLBytes += m_glBytes;
+        if (g_glesDeferTextureGL && !m_obj.renderTarget) m_obj.storagePending = true;   // GL storage on first use
+        else m_obj.createStorage();
         const UINT d3dVisible = (usage & D3DUSAGE_AUTOGENMIPMAP) ? 1 : numLevels;
-        w = width; h = height;
+        UINT w = width, h = height;
         for (UINT i = 0; i < d3dVisible; ++i) {
             m_surfaces.push_back(new IDirect3DSurface9GLES(std::max(w, 1u), std::max(h, 1u), format, m_obj.tex, i, GL_TEXTURE_2D, &m_obj));
             m_surfaces.back()->setContainer(this);
@@ -433,11 +460,47 @@ public:
     }
     STDMETHOD(AddDirtyRect)(const RECT* pDirtyRect) override { return S_OK; }
 
-    GLuint getGLTexture() const { return m_obj.tex; }
+    GLuint getGLTexture() const { return m_obj.name(); }
     GLTextureObject* glObject() { return &m_obj; }
     UINT getWidth() const { return m_width; }
     UINT getHeight() const { return m_height; }
     D3DFORMAT getFormat() const { return m_format; }
+
+    // A whole level of a texture the bridge decodes from DXT (A8B8G8R8), already decoded off the render thread:
+    // the same result as LockRect, copying the pixels in and UnlockRect (format decision, RGB565, upload), without
+    // the two full copies and the conversions on this thread. rgb565: the same pixels as RGB565 when the level is
+    // fully opaque (worker-made), else null.
+    bool uploadDecodedLevel(UINT level, const uint8_t* rgba, const uint8_t* rgb565) {
+        if (level >= m_surfaces.size() || m_format != D3DFMT_A8B8G8R8 || m_obj.renderTarget) return false;
+        IDirect3DSurface9GLES* surface = m_surfaces[level];
+        if (!surface->getCpuBuffer().empty()) return false;   // a level kept for re-locks: the regular path
+        HitchTimer hitch(2);
+        if (!m_obj.formatDecided) {
+            m_obj.formatDecided = true;
+            if (rgb565) m_obj.respecifyAs565();   // first upload fully opaque, as UnlockRect decides
+        }
+        const UINT w = surface->getWidth(), h = surface->getHeight();
+        glBindTexture(GL_TEXTURE_2D, m_obj.name());
+        if (m_obj.rgb565) {
+            std::vector<uint16_t> converted;
+            if (!rgb565) {   // a level with alpha in a texture already stored as RGB565: drop alpha as UnlockRect does
+                converted.resize(static_cast<size_t>(w) * h);
+                for (size_t i = 0; i < converted.size(); ++i) {
+                    const uint8_t* c = rgba + i * 4;
+                    converted[i] = static_cast<uint16_t>(((c[0] >> 3) << 11) | ((c[1] >> 2) << 5) | (c[2] >> 3));
+                }
+                rgb565 = reinterpret_cast<const uint8_t*>(converted.data());
+            }
+            glsc::DriverCpuTimer timer;
+            glTexSubImage2D(GL_TEXTURE_2D, level, 0, 0, w, h, GL_RGB, GL_UNSIGNED_SHORT_5_6_5, rgb565);
+        } else {
+            glsc::DriverCpuTimer timer;
+            glTexSubImage2D(GL_TEXTURE_2D, level, 0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+        }
+        m_obj.onUpload(level, GL_TEXTURE_2D);
+        surface->markUploaded();
+        return true;
+    }
     IDirect3DSurface9GLES* getSurfaceLevel(UINT level) const { return (level < m_surfaces.size()) ? m_surfaces[level] : nullptr; }
 
 private:

@@ -33,6 +33,7 @@ static void ov_is_cyrix(void) {
     g_esp += 4;
 }
 
+#if defined(NFS_R36S) || defined(NFS_FX_PRESHADER_ONLY)
 /* Diagnostics (NFSU2_FX_STATS=1): D3DX effect BeginPass (vtable method 0x0066A9F6, args effect, pass):
  * calls per frame, distinct effects and how often the same effect+pass is applied twice in a row. */
 #include <stdio.h>
@@ -42,7 +43,7 @@ extern void nfs_fx_param_set(uint32_t handle);
 extern void nfs_fx_global_dirty(void);
 extern int nfs_fx_cache_mode(void);
 extern uint32_t getD3D9PresentCount(void);
-static void ov_fx_begin_pass(void) {
+static __attribute__((unused)) void ov_fx_begin_pass(void) {  /* R36S only (NFSU2_FX_STATS) */
     static uint32_t frame, calls, repeats, lastFx, lastPass, frames;
     static uint32_t fx[64]; static uint32_t nfx;
     const uint32_t effect = *(const uint32_t*)ADDR(g_esp + 4), pass = *(const uint32_t*)ADDR(g_esp + 8);
@@ -126,7 +127,7 @@ static const struct { int idx; uint32_t va; } k_fxMethods[] = {
     {78, 0x0067036fU},
     {79, 0x00670b57U}
 };
-static void recomp_call_va(uint32_t va) { recomp_func_t f = recomp_lookup(va); if (f) f(); }
+static inline __attribute__((unused)) void recomp_call_va(uint32_t va) { recomp_func_t f = recomp_lookup(va); if (f) f(); }
 static uint32_t fxMethodCalls[80], fxFrame, fxFrames;
 static void ov_fx_method(void) {
     /* Hot (~4k calls per frame): method index and lifted target from a small direct-mapped cache. */
@@ -157,6 +158,8 @@ static void ov_fx_method(void) {
     }
     if (cFn[h]) cFn[h]();
 }
+#endif /* NFS_R36S || NFS_FX_PRESHADER_ONLY */
+
 /* 0x0075CFD0: the static CRT memcpy/memmove(dst, src, n) (cdecl, returns dst).
  * It handles overlap by copying backward, and reaches its unrolled dword moves
  * through computed jumps into the middle of straight-line blocks (tables at
@@ -172,7 +175,9 @@ static void ov_crt_memmove(void) {
 
 static const struct { uint32_t va; nfs_override_fn fn; } k_overrides[] = {
     { 0x006F5FC5u, ov_is_cyrix },
+#if defined(NFS_R36S)
     { 0x0066A9F6u, ov_fx_begin_pass },
+#endif
     { 0x0075CFD0u, ov_crt_memmove },
 };
 
@@ -180,9 +185,11 @@ static const struct { uint32_t va; nfs_override_fn fn; } k_overrides[] = {
  * effect-method call (overrides are never site-cached): a hash of the ~55 overridden VAs instead of a linear
  * scan of the method table for any target in the D3DX range. Built once; read-only afterwards (the sound
  * threads call this too). */
+#if defined(NFS_R36S)
 extern int nfs_fx_lazy_enabled(void);
 extern void nfs_fx_lazy_begin(void); extern void nfs_fx_lazy_begin_pass(void); extern void nfs_fx_lazy_commit(void);
 extern void nfs_fx_lazy_end_pass(void); extern void nfs_fx_lazy_end(void);
+#endif
 enum { OV_SLOTS = 256 };
 static uint32_t ovKey[OV_SLOTS]; static nfs_override_fn ovFn[OV_SLOTS];
 static volatile int ovReady;
@@ -193,6 +200,7 @@ static void ov_put(uint32_t va, nfs_override_fn fn) {
     if (!ovKey[h]) { ovKey[h] = va; ovFn[h] = fn; }  /* first entry wins, like the scans did */
 }
 static void ov_build(void) {
+#if defined(NFS_R36S)
     const char* e = getenv("NFSU2_FX_STATS");
     const int stats = e && e[0] == '1';
     if (stats || nfs_fx_cache_mode() != 0)
@@ -205,6 +213,16 @@ static void ov_build(void) {
         ov_put(0x006644A6u, nfs_fx_lazy_begin); ov_put(0x0066A9F6u, nfs_fx_lazy_begin_pass);
         ov_put(0x0066A93Bu, nfs_fx_lazy_commit); ov_put(0x0065AAECu, nfs_fx_lazy_end_pass); ov_put(0x0065AA06u, nfs_fx_lazy_end);
     }
+#else
+    /* Android: the effect Set* hooks feed the preshader cache (fx_cache.c, NFS_FX_PRESHADER_ONLY). */
+#if defined(NFS_FX_PRESHADER_ONLY)
+    if (nfs_fx_cache_mode() != 0)
+        for (unsigned i = 0; i < sizeof k_fxMethods / sizeof k_fxMethods[0]; ++i)
+            if (k_fxMethods[i].va != 0x0065e26cu) ov_put(k_fxMethods[i].va, ov_fx_method);
+#endif
+    for (unsigned i = 0; i < sizeof k_overrides / sizeof k_overrides[0]; i++)
+        ov_put(k_overrides[i].va, k_overrides[i].fn);
+#endif
     __atomic_store_n(&ovReady, 1, __ATOMIC_RELEASE);
 }
 nfs_override_fn nfs_override_lookup(uint32_t va) {

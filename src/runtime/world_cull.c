@@ -115,6 +115,10 @@ extern const void* nfsCapRecs(void);
 extern const uint8_t* nfsCapBytes(void);
 extern int nfsD3dDeviceCall(uint32_t method, const uint32_t* args, uint32_t* result);
 extern int nfsD3dCall(uint32_t kind, uint32_t method, const uint32_t* args);
+extern int nfsD3dDrawInstanced(const uint32_t* dip, uint32_t registerCount, const uint16_t* registers, uint32_t instances, const float* data);   /* d3d9_render_thread.inc */
+extern uint32_t nfsD3dTextureChurn(void);              /* d3d9_bridge.cpp: texture objects created or retired so far */
+extern uint32_t nfsD3dObjectSerial(uint32_t handle);   /* d3d9_bridge.cpp: per-object serial, 0 = no such object */
+static uint32_t currentTextureChurn(void);
 /*
  * ---- Item runs with a learned constant model (NFSU2_FLUSH_MERGE, default 1) ----
  * Per item the game spends ~55 us on the device: effect parameters from the world matrix (sub_005BDAF0 and
@@ -157,11 +161,14 @@ static Head heads[2];
 #define RC_MAX 64
 #define RD_MAX 1024
 #define RREG_MAX 96
-typedef struct { uint32_t method, na, a[8], doff, dlen, darg; } RCall;   /* a[k] = argument k+1 (a[0] of the call is the device) */
+typedef struct { uint32_t method, na, a[8], doff, dlen, darg; uint32_t textureSerial; } RCall;   /* a[k] = argument k+1 (a[0] of the call is the device); textureSerial: SetTexture's object */
 typedef struct { uint16_t s, reg; float v[4]; } RReg;
 typedef struct {
     int valid;
     uint32_t mat, slot, sig[5], vs, ps;
+    uint32_t texturesCheckedAtChurn;   /* nfsD3dTextureChurn() when its SetTexture objects were last known current */
+    int texturesStale;                 /* a recorded texture object is gone: re-record on the next full group */
+    uint32_t cleanVerifies;            /* verifications passed in a row (spaces the next ones out) */
     int nset, ncalls; RCall calls[RC_MAX]; uint8_t data[RD_MAX]; uint32_t dused;
     int nregs; RReg regs[RREG_MAX];
     uint32_t uses, changes, flush; int bad;
@@ -325,6 +332,7 @@ static int recCalls(MatRec* rc, int n) {
         RCall* c = &rc->calls[rc->ncalls++];
         c->method = m; c->na = (uint32_t)na;
         for (int k = 1; k < na; ++k) c->a[k - 1] = r[i].a[k];
+        c->textureSerial = m == 65 ? nfsD3dObjectSerial(c->a[1]) : 0;   /* SetTexture(stage, texture) */
         c->dlen = r[i].len[0]; c->darg = r[i].arg[0]; c->doff = rc->dused;
         if (c->dlen) {
             if (c->darg < 1 || c->darg >= (uint32_t)na || rc->dused + c->dlen > RD_MAX) return 0;
@@ -598,6 +606,7 @@ typedef struct {
     uint8_t cls[2][NREG];                      /* chosen class when trusted: 1 L, 2 G, 4 M */
     uint32_t refFlush; uint8_t refHas[2][NREG]; float rref[2][NREG][4]; double xref[2][NREG][4];
     uint8_t chyp[RC_MAX], ccls[RC_MAX];        /* non-constant calls: bit1 G (as the reference's), bit2 M (as the record's) */
+    uint32_t unclassifiedMats[4];              /* while learning: materials with a register that fit no class at all */
     MatRec refRec;                             /* the reference head's calls in this flush */
 } XModel;
 static XModel xmodels[XMODELS];
@@ -606,6 +615,8 @@ static MatRec* mrecs;                          /* open addressing on (slot, mat)
 static uint32_t flushSeq;
 static int g_groupCache = -1;
 static uint32_t stGroupsReplayed, stGroupsFull, stGroupsEmpty, stGroupsVerify, stRecBad, stRelearn;
+static uint32_t stRecTexturesStale, stCacheResetsForTextures;   /* totals: records re-recorded for new textures, caches reset after a texture load */
+static uint32_t stInstancedDraws, stInstancedItems;
 static XModel* xmodelFor(uint32_t vs, uint32_t ps, int create) {
     for (int i = 0; i < XMODELS; ++i) if (xmodels[i].vs == vs && xmodels[i].ps == ps && (vs || ps)) return &xmodels[i];
     if (!create) return NULL;
@@ -669,11 +680,23 @@ static int sameCalls(const MatRec* a, const MatRec* b) {
     }
     return 1;
 }
+/* While an effect is learning, a register that fits no class at all (not W-linear, not as in the reference, not as
+ * in the material's own record) is either one animated material or per-object values (cars: lighting per car).
+ * Up to 3 such materials only retire their records; the 4th rejects the effect (its items then take commit runs).
+ * Returns 1 = only this material. */
+static int noteUnclassifiedMaterial(XModel* effect, uint32_t mat) {
+    for (int i = 0; i < 4; ++i) {
+        if (effect->unclassifiedMats[i] == mat) return 1;
+        if (!effect->unclassifiedMats[i]) { if (i == 3) return 0; effect->unclassifiedMats[i] = mat; return 1; }
+    }
+    return 0;
+}
 /* a full group's first item was recorded into pend (W = its matrix): learn / verify, then store */
 static void groupLearn(MatRec* pend, const float* W, int verifying, uint32_t g) {
     (void)g;
     XModel* x = xmodelFor(pend->vs, pend->ps, 1);
     MatRec* old = recFor(pend->slot, pend->mat, 0);
+    int verificationPassed = 0;
     if (!x) return;
     if (x->refFlush != flushSeq) {
         /* first full group of this effect in this flush: the reference */
@@ -686,11 +709,11 @@ static void groupLearn(MatRec* pend, const float* W, int verifying, uint32_t g) 
             x->refHas[q->s][q->reg] = 1; memcpy(x->rref[q->s][q->reg], q->v, 16);
             for (int r = 0; r < 4; ++r) x->xref[q->s][q->reg][r] = inv[r * 4 + 0] * q->v[0] + inv[r * 4 + 1] * q->v[1] + inv[r * 4 + 2] * q->v[2] + inv[r * 4 + 3] * q->v[3];
         }
-    } else if (x->state >= 0 && old && old->valid == 2 && !old->bad && old->flush != flushSeq) {
+    } else if (x->state >= 0 && old && old->valid == 2 && !old->bad && !old->texturesStale && old->flush != flushSeq) {
         /* compare with the reference group (G, L) and with the material's earlier record (M). Hypotheses keep
          * being refined after the effect is trusted; only a value that fits none of them counts against it. */
         const int trusted = x->state == 1;
-        int matChanged = !sameShape(old, pend), predFail = 0, relearn = 0, regReject = -1;
+        int matChanged = !sameShape(old, pend), predFail = 0, relearn = 0, regReject = -1, registerUnclassified = 0;
         const int refShape = sameShape(&x->refRec, pend);
         for (int i = 0; i < pend->ncalls && !matChanged; ++i) {
             const RCall* q = &pend->calls[i];
@@ -724,19 +747,30 @@ static void groupLearn(MatRec* pend, const float* W, int verifying, uint32_t g) 
                     x->rref[q->s][q->reg][0], x->rref[q->s][q->reg][1], x->rref[q->s][q->reg][2], x->rref[q->s][q->reg][3], l[0], l[1], l[2], l[3]);
             }
             if (*hy & h) { if ((*hy & h) != *hy) relearn = 1; *hy &= h; }
-            else if (!trusted) regReject = q->s * 1000 + q->reg;
-            else matChanged = 1;
+            else if (!trusted && (h || !noteUnclassifiedMaterial(x, pend->mat))) regReject = q->s * 1000 + q->reg;
+            else { matChanged = 1; registerUnclassified = !h; }   /* this material's own value moved (animated, e.g. a scrolling UV offset): retire its record */
         }
         if (regReject >= 0) {
             x->state = -1;
             printf("[NFSU2 GROUPS] effect vs %08x ps %08x rejected: register %c%d fits no class (material %08x)\n", x->vs, x->ps, regReject >= 1000 ? 'p' : 'c', regReject % 1000, pend->mat);
         } else {
+            verificationPassed = verifying && !matChanged && !predFail;
             if (matChanged) {
                 /* this material's calls or constants moved on their own (animated texture...): retire its record */
                 if ((++old->changes >= 3 || verifying) && !old->bad) { old->bad = 1; ++stRecBad; }
-                if (verifying && trusted && ++x->nbad >= 32) { x->state = -1; printf("[NFSU2 GROUPS] effect vs %08x ps %08x rejected (32 failed verifications)\n", x->vs, x->ps); }
+                /* trusted while its objects stood still (cars on the grid), then per-object values: the 4th material
+                 * whose register fits no class rejects the effect, so its items go back to commit runs */
+                if (trusted && ((verifying && ++x->nbad >= 32) || (registerUnclassified && !noteUnclassifiedMaterial(x, pend->mat))))
+                    { x->state = -1; printf("[NFSU2 GROUPS] effect vs %08x ps %08x rejected (%u failed verifications)\n", x->vs, x->ps, x->nbad); }
             } else if (predFail) ++stRelearn;
             if (x->state == 0 && !matChanged && ++x->nobs >= 24) { x->state = 1; relearn = 1; printf("[NFSU2 GROUPS] effect vs %08x ps %08x trusted after %u observations\n", x->vs, x->ps, x->nobs); }
+            if (x->state == 1 && relearn) {   /* which constant registers follow the world matrix (instancing input) */
+                printf("[NFSU2 GROUPS] effect vs %08x: world-matrix registers", x->vs);
+                for (int k = 0; k < NREG; ++k) if (x->refHas[0][k] && (x->hyp[0][k] & 1)) printf(" c%d", k);
+                printf("; pixel");
+                for (int k = 0; k < NREG; ++k) if (x->refHas[1][k] && (x->hyp[1][k] & 1)) printf(" c%d", k);
+                printf("\n");
+            }
             if (x->state == 1 && relearn) {
                 for (int s2 = 0; s2 < 2; ++s2) for (int k = 0; k < NREG; ++k) {
                     const uint8_t h = x->hyp[s2][k];
@@ -750,8 +784,11 @@ static void groupLearn(MatRec* pend, const float* W, int verifying, uint32_t g) 
     MatRec* r = old ? old : recFor(pend->slot, pend->mat, 1);
     if (!r) return;
     const uint32_t uses = old ? old->uses : 0, changes = old ? old->changes : 0; const int bad = old ? old->bad : 0;
+    const uint32_t cleanVerifies = !old ? 0 : verificationPassed ? old->cleanVerifies + 1 : verifying ? 0 : old->cleanVerifies;
     memcpy(r, pend, sizeof *r);
     r->uses = uses; r->changes = changes; r->bad = bad; r->flush = flushSeq; r->valid = 2;
+    r->cleanVerifies = cleanVerifies;
+    r->texturesCheckedAtChurn = currentTextureChurn();   /* just recorded: its texture objects are the current ones */
 }
 /* send constant registers of a record: all of them (first item) or the L ones only */
 static void sendRegs(const XModel* x, const MatRec* rc, const float* W, int lOnly) {
@@ -773,21 +810,63 @@ static void sendRegs(const XModel* x, const MatRec* rc, const float* W, int lOnl
         i = e;
     }
 }
-static int canReplay(MatRec* rc, uint32_t g, XModel** xo, int* verify) {
+/* Texture objects created or retired so far. Test switch NFSU2_TEST_TEXTURE_CHURN=<frame>[:<count>|:stale]: from
+ * that frame on, <count> (default 1) extra changes are reported (1: every record re-checks its textures; >64: the
+ * caches reset), or (stale) every record's textures count as replaced once. */
+static int testStaleFrame = -1;
+static uint32_t currentTextureChurn(void) {
+    static int testFrame = -1; static uint32_t testCount;
+    if (testFrame == -1) {
+        const char* e = getenv("NFSU2_TEST_TEXTURE_CHURN");
+        const char* colon = e ? strchr(e, ':') : NULL;
+        testFrame = e ? atoi(e) : -2;
+        testCount = colon && strcmp(colon + 1, "stale") ? (uint32_t)atoi(colon + 1) : 1;
+        if (colon && !strcmp(colon + 1, "stale")) testStaleFrame = testFrame;
+    }
+    uint32_t churn = nfsD3dTextureChurn();
+    if (testFrame >= 0 && getD3D9PresentCount() >= (uint32_t)testFrame) churn += testCount;
+    return churn;
+}
+/* Every SetTexture of the record still binds the texture object that was recorded (not a new object at a
+ * reused handle, nor a released one). Called only when textures were created or retired since the last check. */
+static int recordTexturesCurrent(const MatRec* record) {
+    if (testStaleFrame >= 0 && record->texturesCheckedAtChurn == nfsD3dTextureChurn()) return 0;   /* test: first check after the frame */
+    for (int i = 0; i < record->ncalls; ++i) {
+        const RCall* call = &record->calls[i];
+        if (call->method == 65 && call->a[1] && nfsD3dObjectSerial(call->a[1]) != call->textureSerial) return 0;
+    }
+    return 1;
+}
+/* Verify every 16th use of a record; one that keeps passing is verified every 32nd, then every 64th use. */
+static uint32_t verifyInterval(const MatRec* record) {
+    return record->cleanVerifies >= 8 ? 64u : record->cleanVerifies >= 4 ? 32u : 16u;
+}
+/* 1 = replay group g from its material's record (*effectOut = the trusted effect model). 0 = draw it fully;
+ * *verify = 1 when that full draw is this record's periodic check. */
+static int canReplay(MatRec* record, uint32_t group, XModel** effectOut, int* verify) {
     *verify = 0;
-    if (!rc || rc->valid != 2 || rc->bad) return 0;
-    XModel* x = xmodelFor(rc->vs, rc->ps, 0);
-    if (!x || x->state != 1 || x->refFlush != flushSeq) return 0;
-    if (!sameShape(&x->refRec, rc)) { for (int i = 0; i < rc->ncalls; ++i) if (x->ccls[i] == 2) return 0; }
-    for (uint32_t it = M32(g + 0x18); it != g + 0x18; it = M32(it)) {
-        if (!validGuest(it) || !runnable(it)) return 0;
-        uint32_t sg[5]; sigOf(it, sg);
-        if (memcmp(sg, rc->sig, sizeof sg)) return 0;
-        const uint32_t solid = M32(M32(it + 0x10));
+    if (!record || record->valid != 2 || record->bad || record->texturesStale) return 0;
+    XModel* effect = xmodelFor(record->vs, record->ps, 0);
+    if (!effect || effect->state != 1 || effect->refFlush != flushSeq) return 0;
+    if (!sameShape(&effect->refRec, record)) {
+        /* calls taken from this flush's reference group need the same call layout */
+        for (int i = 0; i < record->ncalls; ++i) if (effect->ccls[i] == 2) return 0;
+    }
+    const uint32_t itemsHead = group + 0x18;
+    for (uint32_t item = M32(itemsHead); item != itemsHead; item = M32(item)) {
+        if (!validGuest(item) || !runnable(item)) return 0;
+        uint32_t itemSig[5]; sigOf(item, itemSig);
+        if (memcmp(itemSig, record->sig, sizeof itemSig)) return 0;
+        const uint32_t solid = M32(M32(item + 0x10));
         if (!validGuest(solid) || !M32(solid + 0x2c)) return 0;   /* vertex buffer not created yet: full path */
     }
-    if ((++rc->uses & 15) == 0) { *verify = 1; return 0; }
-    *xo = x;
+    const uint32_t textureChurn = currentTextureChurn();
+    if (record->texturesCheckedAtChurn != textureChurn) {
+        if (!recordTexturesCurrent(record)) { record->texturesStale = 1; ++stRecTexturesStale; return 0; }
+        record->texturesCheckedAtChurn = textureChurn;
+    }
+    if (++record->uses % verifyInterval(record) == 0) { *verify = 1; return 0; }
+    *effectOut = effect;
     return 1;
 }
 /*
@@ -834,6 +913,61 @@ static int replaySetup(uint32_t mat) {
     if (!M8(mat + 0x52)) M32(0x870948) = 0;
     return 1;
 }
+/* ---- Instanced replay (NFSU2_INSTANCING, default 1) ----
+ * Consecutive items of a replayed group that draw the same mesh range (lamp posts, barriers, trees) differ only
+ * in their world matrix, i.e. in the effect's L registers. They go to the bridge as one instanced draw with
+ * W * x of each item (d3d9_gles: an instanced shader variant reads those registers per instance). Effects
+ * with a pixel-shader L register are not instanced. */
+#define INSTANCE_MAX 64
+#define INSTANCE_REGS 16
+static int instancingEnabled(void) {
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("NFSU2_INSTANCING"); on = !(e && e[0] == '0'); }
+    return on;
+}
+static inline void unlinkItem(uint32_t it) { const uint32_t n = M32(it), pv = M32(it + 4); M32(pv) = n; M32(n + 4) = pv; }
+/* the vertex-shader registers of a record that follow the world matrix; 0: none, too many, or a pixel-shader one */
+static int worldMatrixRegisters(const XModel* x, const MatRec* rc, uint16_t* regs) {
+    int n = 0;
+    for (int i = 0; i < rc->nregs; ++i) {
+        const RReg* q = &rc->regs[i];
+        if (x->cls[q->s][q->reg] != 1) continue;
+        if (q->s) return 0;
+        int dup = 0; for (int j = 0; j < n; ++j) dup |= regs[j] == q->reg;
+        if (dup) continue;
+        if (n == INSTANCE_REGS) return 0;
+        regs[n++] = q->reg;
+    }
+    return n;
+}
+/* `it` (unlinked, buffers bound) and the following items of group g with its mesh range as one instanced draw.
+ * Returns the last item drawn (its W is now in the registers), 0 = no run: draw `it` alone (*refused: the bridge
+ * did not take it, e.g. render thread off or a recording running). */
+static uint32_t drawInstancedRun(const XModel* x, uint32_t g, uint32_t it, const uint16_t* regs, int nregs, int* refused) {
+    const uint32_t solid = M32(M32(it + 0x10)), strip = M32(it + 8);
+    uint32_t items[INSTANCE_MAX]; uint32_t n = 1; items[0] = it;
+    for (uint32_t next = M32(g + 0x18); next != g + 0x18 && n < INSTANCE_MAX; next = M32(next)) {
+        const uint32_t s2 = M32(next + 8);
+        if (M32(M32(next + 0x10)) != solid || M32(s2 + 0x34) != M32(strip + 0x34) || M32(s2 + 0xC) != M32(strip + 0xC)) break;
+        items[n++] = next;
+    }
+    if (n < 2) return 0;
+    float data[INSTANCE_MAX * INSTANCE_REGS * 4];
+    for (uint32_t i = 0; i < n; ++i) {
+        const float* W = (const float*)ADDR(M32(items[i] + 0x24));
+        for (int j = 0; j < nregs; ++j) mulWx(W, x->xref[0][regs[j]], data + (i * (uint32_t)nregs + (uint32_t)j) * 4);
+    }
+    /* drawItem's DrawIndexedPrimitive: triangle list, base 0, min 0, vertex count, start index, primitives */
+    const uint32_t dip[6] = {4, 0, 0, M32(solid + 0x34), (uint32_t)((int32_t)(M32(strip + 0x34) - M32(solid + 0x18)) >> 1), M32(strip + 0xC) / 3};
+    if (!nfsD3dDrawInstanced(dip, (uint32_t)nregs, regs, n, data)) { *refused = 1; return 0; }
+    for (uint32_t i = 1; i < n; ++i) {
+        unlinkItem(items[i]); countItem(items[i]);
+        ++stFlushItems; ++stFlushFast;
+        freeTo(0x87091C, items[i]);
+    }
+    ++stInstancedDraws; stInstancedItems += n;
+    return items[n - 1];
+}
 static void replayGroup(MatRec* rc, XModel* x, uint32_t g) {
     const uint32_t dev = M32(0x870974);
     for (int i = 0; i < rc->ncalls; ++i) {
@@ -847,14 +981,23 @@ static void replayGroup(MatRec* rc, XModel* x, uint32_t g) {
         if (!nfsD3dCall(2, c->method, a)) devMethod(c->method, (int)c->na, a);
         g_esp += room;
     }
-    int first = 1; uint32_t lastW = 0;
+    int first = 1, instancing = instancingEnabled(); uint32_t lastW = 0;
+    uint16_t instanceRegs[INSTANCE_REGS]; int nInstanceRegs = -1;   /* the record's world-matrix registers, on first use */
     while (M32(g + 0x18) != g + 0x18) {
         const uint32_t it = M32(g + 0x18);
-        { const uint32_t n = M32(it), pv = M32(it + 4); M32(pv) = n; M32(n + 4) = pv; }
+        unlinkItem(it);
         const uint32_t wp = M32(it + 0x24);
         if (first || wp != lastW) sendRegs(x, rc, (const float*)ADDR(wp), !first);
         first = 0; lastW = wp;
-        if (bindBuffers(it, 1)) { drawItem(it, 1); countItem(it); }
+        if (bindBuffers(it, 1)) {
+            if (instancing && nInstanceRegs < 0) nInstanceRegs = worldMatrixRegisters(x, rc, instanceRegs);
+            int refused = 0;
+            const uint32_t lastOfRun = instancing && nInstanceRegs > 0 ? drawInstancedRun(x, g, it, instanceRegs, nInstanceRegs, &refused) : 0;
+            if (refused) instancing = 0;   /* not for the rest of the group either */
+            if (lastOfRun) lastW = M32(lastOfRun + 0x24);
+            else drawItem(it, 1);
+            countItem(it);
+        }
         ++stFlushItems; ++stFlushFast;
         freeTo(0x87091C, it);
     }
@@ -884,8 +1027,6 @@ static void printCalls(int n) {
     }
 }
 static void traceItem(uint32_t it, uint32_t g, int n) {
-    const CapRec* r = (const CapRec*)nfsCapRecs();
-    const uint8_t* bytes = nfsCapBytes();
     printf("[ITEM] g=%08x it=%08x mat=%08x key=%08x fx=%08x npass=%u solid=%08x calls=%d slot=%u\n", g, it, M32(it + 0x24), M32(it + 0x18),
            M32(M32(it + 0x18) + 0x20), M32(M32(it + 0x18) + 0x14), validGuest(M32(it + 0x10)) ? M32(M32(it + 0x10)) : 0u, n, (M32(0x870910) ? 0u : 0u));
     if (validGuest(M32(it + 0x24))) { const float* W = (const float*)ADDR(M32(it + 0x24)); printf("   W"); for (int k = 0; k < 16; ++k) printf(" %.6g", W[k]); printf("\n"); }
@@ -1002,11 +1143,13 @@ void sub_005CF150(void) {
         float cam[3];
         for (int j = 0; j < 3; ++j) cam[j] = -(V[12] * V[j * 4 + 0] + V[13] * V[j * 4 + 1] + V[14] * V[j * 4 + 2]);
         const uint32_t itemPool = M32(0x87091C);
+        /* how adjacent items differ: diagnostics only, sampled on every 8th frame (scaled when printed) */
+        const int sampleAdjacentStats = (getD3D9PresentCount() & 7u) == 0;
         for (uint32_t b = 0; b < 368; ++b) {  /* 16 layers x 23 shader slots */
             const uint32_t s = b % 23, head = 0x870D30u + b * 8;
             for (uint32_t g = M32(head); g != head && validGuest(g); g = M32(g)) {
                 ++slotGroups[s];
-                {
+                if (sampleAdjacentStats) {
                     uint32_t prev = 0;
                     for (uint32_t it = M32(g + 0x18); it != g + 0x18 && validGuest(it); it = M32(it)) {
                         ++slotItems[s];
@@ -1067,11 +1210,13 @@ void sub_005CF150(void) {
             printf("[NFSU2 FLUSH] native flushes %u, lifted %u; items/frame %u: fast %u, learning %u, verified %u (merge %d); models trusted %u, learning %u, rejected %u\n",
                    stFlushNative, stFlushLifted, stFlushItems / 240, stFlushFast / 240, stFlushLearn / 240, stFlushVerify / 240, g_merge, tr, le, rj); }
             printf("[NFSU2 FLUSH] adjacent items differ in: matrix %u, fxinfo %u, +1c %u, +20 %u, flags %u, +28 %u, strip %u; identical %u; same solid %u; equal matrix contents %u; identity matrix %u\n",
-                   stDiff[0] / 240, stDiff[1] / 240, stDiff[2] / 240, stDiff[3] / 240, stDiff[4] / 240, stDiff[5] / 240, stDiff[6] / 240, stDiff[7] / 240, stDiff[8] / 240, stDiff[9] / 240, stDiffIdent / 240);
+                   stDiff[0] / 30, stDiff[1] / 30, stDiff[2] / 30, stDiff[3] / 30, stDiff[4] / 30, stDiff[5] / 30, stDiff[6] / 30, stDiff[7] / 30, stDiff[8] / 30, stDiff[9] / 30, stDiffIdent / 30);   /* sampled 1 frame in 8: 240/8 */
             memset(stDiff, 0, sizeof stDiff); stDiffIdent = 0;
             { uint32_t tr = 0, le = 0, rj = 0; for (int k = 0; k < XMODELS; ++k) if (xmodels[k].vs || xmodels[k].ps) { if (xmodels[k].state > 0) ++tr; else if (xmodels[k].state < 0) ++rj; else ++le; }
-              printf("[NFSU2 GROUPS] groups/frame: replayed %u, full %u (verifying %u), empty skipped %u; records retired %u, relearned %u; effects trusted %u, learning %u, rejected %u (cache %d)\n",
-                     stGroupsReplayed / 240, stGroupsFull / 240, stGroupsVerify / 240, stGroupsEmpty / 240, stRecBad, stRelearn, tr, le, rj, g_groupCache); }
+              printf("[NFSU2 GROUPS] groups/frame: replayed %u, full %u (verifying %u), empty skipped %u; records retired %u, relearned %u, re-recorded for new textures %u; caches reset for texture loads %u; effects trusted %u, learning %u, rejected %u (cache %d)\n",
+                     stGroupsReplayed / 240, stGroupsFull / 240, stGroupsVerify / 240, stGroupsEmpty / 240, stRecBad, stRelearn, stRecTexturesStale, stCacheResetsForTextures, tr, le, rj, g_groupCache); }
+            printf("[NFSU2 GROUPS] instanced draws/frame %u covering %u replayed items (NFSU2_INSTANCING %d)\n", stInstancedDraws / 240, stInstancedItems / 240, instancingEnabled());
+            stInstancedDraws = stInstancedItems = 0;
             stGroupsReplayed = stGroupsFull = stGroupsVerify = stGroupsEmpty = 0;
             printf("[NFSU2 COMMIT] items/frame: in an open pass %u, opening %u, groups continuing a run %u (mode %d, cross %d)", stCommitItems / 240, stCommitFull / 240, stCommitCross / 240, g_commitRun, g_commitCross);
             if (g_commitTime && stCommitItems && stCommitFull) printf("; %.1f us per committed item, %.1f us per full item", stCommitNs / 1000.0 / stCommitItems, stFullNs / 1000.0 / stCommitFull);
@@ -1097,6 +1242,18 @@ void sub_005CF150(void) {
             if (g_groupCache < 0) { const char* e = getenv("NFSU2_GROUP_CACHE"); g_groupCache = e ? atoi(e) : 1; }
             if (nowF > lastFlushFrame + 10 || nowF < lastFlushFrame) resetCaches();   /* loading screens: objects may be gone */
             lastFlushFrame = nowF;
+            /* A world section (re)loaded its textures during play (~500 at once on the device): the learned records
+             * and effect models describe the old objects. Relearning (~1 s) beats checking each record, and frees
+             * the record and model tables for the new materials. A few textures (streaming) are caught per record. */
+            {
+                static uint32_t textureChurnAtLastFlush;
+                const uint32_t textureChurn = currentTextureChurn();
+                if (textureChurn - textureChurnAtLastFlush > 64u) {
+                    resetCaches(); ++stCacheResetsForTextures;
+                    printf("[NFSU2 GROUPS] frame %u: %u textures created or released since the last flush, learned records reset\n", nowF, textureChurn - textureChurnAtLastFlush);
+                }
+                textureChurnAtLastFlush = textureChurn;
+            }
             /* Flushes of the same view (view + projection matrices) in the same frame share the group-replay
              * reference (NFSU2_REF_PER_VIEW, default 1): the game flushes ~11 times per frame. */
             static int perView = -1;

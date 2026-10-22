@@ -1,5 +1,6 @@
 /*
- * fx_cache.c - skip D3DX effect preshader evaluations whose inputs did not change (R36S).
+ * fx_cache.c - skip D3DX effect preshader evaluations whose inputs did not change (R36S; Android: the
+ * preshader part only, NFS_FX_PRESHADER_ONLY).
  *
  * The game applies a D3DX effect pass (ID3DXEffect::BeginPass, vtable 66 = 0x0066A9F6) once per drawn
  * object, ~900 times per race frame, and 97% of the time it is the same pass as before. Each application
@@ -102,6 +103,9 @@ void sub_00664743(void) {
     sKey[h] = st; sEval[h] = counter; memcpy(sOut[h], v, 16);
 }
 
+/* NFS_FX_PRESHADER_ONLY (Android): only the preshader cache above. The rest of this file replays device
+ * calls through the R36S render thread's queue (d3d9_render_thread.inc), which the Android backends lack. */
+#if !defined(NFS_FX_PRESHADER_ONLY)
 /*
  * ---- Effect state application memo (sub_00668FAA) ----
  *
@@ -422,3 +426,4 @@ void sub_00668EC5(void) {
     }
     g_eax = result; g_esp += 12;  /* ret 8 */
 }
+#endif /* !NFS_FX_PRESHADER_ONLY */

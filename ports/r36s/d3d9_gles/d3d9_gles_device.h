@@ -210,7 +210,24 @@ public:
 private:
     friend class IDirect3DStateBlock9GLES;
 
-    bool prepareDraw(const void* upData, UINT upStride, INT baseVertex);
+    // instanceLayout: id of the instanced vertex-shader variant to use (0 = the normal one); *instancingUnavailable
+    // is set when that variant cannot be made (nothing is drawn then: the caller draws the instances one by one).
+    bool prepareDraw(const void* upData, UINT upStride, INT baseVertex, uint32_t instanceLayout = 0, bool* instancingUnavailable = nullptr);
+public:
+    // One DrawIndexedPrimitive repeated for `instances` objects that differ only in the vertex-shader registers
+    // `registers` (count each): data holds instances x count vec4. Leaves the register file as the last instance
+    // set it. false = not drawn (no GLES 3, or no instanced variant): draw them one by one.
+    bool drawIndexedInstanced(D3DPRIMITIVETYPE type, INT baseVertex, UINT minVertex, UINT numVertices, UINT startIndex, UINT primitives,
+                              const uint16_t* registers, uint32_t count, uint32_t instances, const float* data);
+private:
+    struct Instancing {
+        bool initialized = false, available = false;
+        GLuint instanceNumbers = 0;   // vertex buffer: 0, 1, 2, ... kMaxInstancesPerDraw-1 (float)
+        void (*drawElementsInstanced)(GLenum, GLsizei, GLenum, const void*, GLsizei) = nullptr;
+        void (*vertexAttribDivisor)(GLuint, GLuint) = nullptr;
+        uint64_t draws = 0, instances = 0;
+    } m_instancing;
+    void initInstancing();
     void bindRenderTarget();
     void createBackBufferTarget(UINT width, UINT height);
     void destroyBackBufferTarget();
@@ -230,6 +247,12 @@ private:
     IDirect3D9GLES* m_parentD3D = nullptr;
     SDL_Window* m_sdlWindow = nullptr;
     SDL_GLContext m_glContext = nullptr;
+#ifdef __ANDROID__
+    EGLDisplay m_eglDisplay = EGL_NO_DISPLAY;
+    EGLSurface m_eglSurface = EGL_NO_SURFACE;
+    EGLContext m_eglContext = EGL_NO_CONTEXT;
+    EGLConfig  m_eglConfig = nullptr;
+#endif
     D3DPRESENT_PARAMETERS m_presentParams{};
 
     IDirect3DSurface9GLES* m_defaultBackBuffer = nullptr;

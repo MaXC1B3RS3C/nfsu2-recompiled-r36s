@@ -16,6 +16,7 @@
 // NFSU2_RENDER_THREAD=0 disables it.
 #if defined(NFS_R36S)
 #include <condition_variable>
+#include <deque>
 #include <mutex>
 #include <exception>
 #include <functional>
@@ -23,7 +24,7 @@
 extern "C" void d3d9NoteGameThread();
 
 namespace rt {
-enum Op:uint16_t {OpDevice,OpAddRef,OpRelease,OpStateBlock,OpSync,OpFunction,OpRefDelta,OpBufferUpdate,OpTexUpload};
+enum Op:uint16_t {OpDevice,OpAddRef,OpRelease,OpStateBlock,OpSync,OpFunction,OpRefDelta,OpBufferUpdate,OpTexUpload,OpInstancedDraw};
 struct SyncSlot {uint32_t token=0;const uint32_t* args=nullptr;uint32_t count=0;uint32_t result=0;std::exception_ptr error;std::function<void()> fn;std::atomic<bool> done{false};};
 struct Cmd {uint16_t op;uint16_t method;uint32_t a[9];const void* p0;const void* p1;void* obj;void* obj2;SyncSlot* sync;};
 
@@ -45,7 +46,7 @@ int arenaIndex=0;
 // shaders and textures constantly (~18k state calls per race frame); a shadow of what was last queued
 // drops repeats before they cost a queue slot and render-thread work. The shadow is forgotten at every
 // synchronous call (state blocks, Reset, ...) and every state-block Apply, which change device state
-// behind it; handles also carry objectsEpoch so a recreated object at the same handle is never skipped.
+// behind it; handles also carry handlesRetiredEpoch so a recreated object at the same handle is never skipped.
 struct Shadow {
     uint32_t rs[256];bool rsValid[256];
     uint32_t ss[16][16];bool ssValid[16][16];
@@ -120,6 +121,60 @@ void drain(){
     wake();
     waitDone([&]{return tail.load(std::memory_order_acquire)==target;},1);
 }
+// ---- DXT decoding on worker threads ----
+// The GPU samples no DXT format here, so every DXT level is decoded to RGBA on the CPU before it is uploaded. That
+// ran on the render thread, one level after another (~4900 levels at the race load; ~0.6 ms per upload on the
+// device, decode included). Levels are now decoded by NFSU2_DECODE_THREADS workers (default 2; 0 = on the render
+// thread as before) from the moment the game unlocks them. When the upload command comes up, the render thread takes
+// the finished pixels, decodes the level itself if no worker has started it, or else waits for that worker.
+struct DecodeJob {
+    uint32_t mode,width,height;const uint8_t* raw;size_t size;  // raw: the level's bytes in the frame arena
+    std::vector<uint8_t> pixels;   // RGBA8
+    std::vector<uint8_t> rgb565;   // the same pixels as RGB565 when every texel is opaque, else empty
+    bool done=false;bool started=false;  // under DecodePool::mutex
+};
+class DecodePool {
+    std::mutex mutex;std::condition_variable workAvailable,jobFinished;
+    std::deque<DecodeJob*> queued;std::vector<std::thread> workers;
+    static void decode(DecodeJob& job){
+        job.pixels=decodeDXT(job.mode,job.width,job.height,job.raw,job.size);
+        // what the upload decides on the render thread: an opaque first level stores the texture as RGB565
+        const size_t texels=size_t(job.width)*job.height;bool opaque=job.pixels.size()>=texels*4;
+        for(size_t i=0;opaque&&i<texels;++i)opaque=job.pixels[i*4+3]==255;
+        if(!opaque)return;
+        job.rgb565.resize(texels*2);uint16_t* out=reinterpret_cast<uint16_t*>(job.rgb565.data());
+        for(size_t i=0;i<texels;++i){const uint8_t* c=&job.pixels[i*4];out[i]=static_cast<uint16_t>(((c[0]>>3)<<11)|((c[1]>>2)<<5)|(c[2]>>3));}
+    }
+    void work(){
+        pthread_setname_np(pthread_self(),"dxt-decode");
+        std::unique_lock<std::mutex> lock(mutex);
+        for(;;){
+            workAvailable.wait(lock,[&]{return !queued.empty();});
+            DecodeJob* job=queued.front();queued.pop_front();job->started=true;
+            lock.unlock();decode(*job);lock.lock();
+            job->done=true;jobFinished.notify_all();
+        }
+    }
+public:
+    bool enabled(){
+        static const unsigned threads=[]{const char* e=std::getenv("NFSU2_DECODE_THREADS");return e?unsigned(std::atoi(e)):2u;}();
+        if(threads&&workers.empty()){for(unsigned i=0;i<threads&&i<4;++i)workers.emplace_back([this]{work();});
+            for(auto& w:workers)w.detach();}
+        return threads!=0;
+    }
+    void submit(DecodeJob* job){{std::lock_guard<std::mutex> lock(mutex);queued.push_back(job);}workAvailable.notify_one();}
+    // Waits until a submitted job is decoded (render thread).
+    void finish(DecodeJob* job){
+        std::unique_lock<std::mutex> lock(mutex);
+        if(!job->started){  // still queued: decode it here rather than wait behind other levels
+            queued.erase(std::find(queued.begin(),queued.end(),job));job->started=true;
+            lock.unlock();decode(*job);lock.lock();job->done=true;
+        }
+        jobFinished.wait(lock,[&]{return job->done;});
+    }
+};
+DecodePool decodePool;
+std::vector<uint8_t> instancePayload;   // nfsD3dDrawInstanced scratch (game thread)
 uint64_t statPushed=0,statSyncs=0;
 std::unordered_map<uint32_t,uint32_t> syncCounts;  // per token, logged every 600 frames
 struct HudRec;void hudRecordInvalidate();extern bool hudRecording;
@@ -195,6 +250,8 @@ void execDevice(const Cmd& c){
     case 113:d->SetPixelShaderConstantB(a[1],static_cast<const BOOL*>(c.p0),a[3]);break;
     }
 }
+// OpInstancedDraw payload: the register numbers (uint16), then the per-instance data from a 16-byte boundary.
+inline size_t instanceDataOffset(uint32_t registerCount){return (size_t(registerCount)*2+15)&~size_t(15);}
 void exec(const Cmd& c){
     switch(c.op){
     case OpDevice:execDevice(c);break;
@@ -213,7 +270,13 @@ void exec(const Cmd& c){
             auto& t=*static_cast<CompressedTexture*>(c.obj2);auto& raw=t.bytes(0,level);
             std::memcpy(raw.data(),c.p0,std::min<size_t>(raw.size(),c.a[1]));
             const uint32_t w=t.mipWidth(level),h=t.mipHeight(level);
-            auto pixels=decodeDXT(t.mode(),w,h,raw.data(),raw.size());
+            std::vector<uint8_t> pixels;
+            if(c.p1){  // decoded by a worker: uploaded as it is, or through LockRect/UnlockRect when the texture needs that
+                std::unique_ptr<DecodeJob> job(static_cast<DecodeJob*>(const_cast<void*>(c.p1)));decodePool.finish(job.get());
+                if(job->pixels.size()==size_t(w)*h*4&&glesUploadDecodedLevel(tex,level,job->pixels.data(),job->rgb565.empty()?nullptr:job->rgb565.data()))break;
+                pixels=std::move(job->pixels);
+            }
+            else pixels=decodeDXT(t.mode(),w,h,raw.data(),raw.size());
             if(SUCCEEDED(tex->LockRect(level,&lr,nullptr,0))&&lr.pBits){
                 for(uint32_t row=0;row<h;++row)std::memcpy(static_cast<uint8_t*>(lr.pBits)+size_t(row)*lr.Pitch,pixels.data()+size_t(row)*w*4,size_t(w)*4);
                 tex->UnlockRect(level);
@@ -224,6 +287,16 @@ void exec(const Cmd& c){
         }
         break;}
     case OpStateBlock:if(c.method==4)static_cast<IDirect3DStateBlock9*>(c.obj)->Capture();else static_cast<IDirect3DStateBlock9*>(c.obj)->Apply();break;
+    case OpInstancedDraw:{  // a[0..5] DrawIndexedPrimitive arguments, a[6] registers per instance, a[7] instances; p0 registers then data
+        auto device=static_cast<IDirect3DDevice9*>(c.obj);const uint32_t count=c.a[6],instances=c.a[7];
+        const auto registers=static_cast<const uint16_t*>(c.p0);
+        const auto data=reinterpret_cast<const float*>(static_cast<const uint8_t*>(c.p0)+instanceDataOffset(count));
+        if(glesDrawIndexedInstanced(device,c.a,registers,count,instances,data))break;
+        for(uint32_t i=0;i<instances;++i){  // no instanced variant: the same draws one by one
+            for(uint32_t j=0;j<count;++j)device->SetVertexShaderConstantF(registers[j],data+(size_t(i)*count+j)*4,1);
+            device->DrawIndexedPrimitive(static_cast<D3DPRIMITIVETYPE>(c.a[0]),static_cast<INT>(c.a[1]),c.a[2],c.a[3],c.a[4],c.a[5]);
+        }
+        break;}
     case OpSync:{SyncSlot& s=*c.sync;
         try{s.result=dispatchGuestD3D9Inner(s.token,s.args,&s.count);}catch(...){s.error=std::current_exception();}
         s.done.store(true,std::memory_order_release);{std::lock_guard<std::mutex> l(doneMutex);}doneCv.notify_all();break;}
@@ -266,29 +339,36 @@ void stop(){
     if(worker.joinable())worker.join();
 }
 
-// Handle -> native lookups for SetTexture/SetStreamSource/... (thousands per frame): a small direct-mapped
-// cache on the game thread, invalidated whenever a handle is created or retired (objectsEpoch).
+// Handle -> native lookups for SetTexture/SetStreamSource/... (thousands per frame): a direct-mapped cache on the
+// game thread, invalidated whenever a handle is retired (handlesRetiredEpoch). Unknown handles are not cached: an
+// object created later at that handle does not bump the epoch. 2048 slots: a race frame binds a few hundred vertex
+// buffers, which kept evicting each other in the former 256. Plain statics (not per thread: 48 KB each): D3D9 calls
+// come from guest threads holding the machine, one at a time.
+constexpr uint32_t handleCacheSlots=2048;
+inline uint32_t handleCacheSlot(uint32_t address){return (address*0x9E3779B1u)>>21;}   // top 11 bits
 template<class T>T* cachedNative(uint32_t address){
     if(!address)return nullptr;
     struct Entry{uint32_t address;uint64_t epoch;void* native;};
-    static thread_local Entry cache[256];
-    Entry& e=cache[(address>>3)&255];
-    const uint64_t curEpoch=objectsEpoch.load(std::memory_order_acquire);
+    static Entry cache[handleCacheSlots];
+    Entry& e=cache[handleCacheSlot(address)];
+    const uint64_t curEpoch=handlesRetiredEpoch.load(std::memory_order_acquire);
     if(e.address==address&&e.epoch==curEpoch)return static_cast<T*>(e.native);
     T* native=nativeObject<T>(address);
-    e={address,curEpoch,native};return native;
+    if(native)e={address,curEpoch,native};
+    return native;
 }
 // Same for the Object records (AddRef/Release of textures: thousands per frame).
 Object* cachedObject(uint32_t address){
     if(!address)return nullptr;
     struct Entry{uint32_t address;uint64_t epoch;Object* object;};
-    static thread_local Entry cache[256];
-    Entry& e=cache[(address>>3)&255];
-    const uint64_t curEpoch=objectsEpoch.load(std::memory_order_acquire);
+    static Entry cache[handleCacheSlots];
+    Entry& e=cache[handleCacheSlot(address)];
+    const uint64_t curEpoch=handlesRetiredEpoch.load(std::memory_order_acquire);
     if(e.address==address&&e.epoch==curEpoch)return e.object;
     std::lock_guard<std::recursive_mutex> lock(objectsMutex);
     auto found=objects.find(address);Object* o=found==objects.end()?nullptr:&found->second;
-    e={address,curEpoch,o};return o;
+    if(o)e={address,curEpoch,o};
+    return o;
 }
 // Dynamic vertex/index buffers: Lock/Unlock without waiting for the render thread. Each dynamic buffer gets a
 // permanent guest-memory copy (filled once from the native buffer); Lock returns a pointer into it, Unlock
@@ -404,7 +484,14 @@ bool textureLockAsync(uint32_t method,const uint32_t* args,uint32_t* count,uint3
     if(o&&o->kind==Kind::Texture){
         Cmd c{};c.op=OpTexUpload;c.obj=o->native;c.obj2=o->compressed.texture.get();
         c.a[0]=level;c.a[1]=L.size;c.a[2]=L.pitch;c.a[3]=L.rows;c.a[4]=L.rowBytes;
-        c.p0=copyData(pointer(L.guest),L.size);push(c);
+        c.p0=copyData(pointer(L.guest),L.size);
+        if(CompressedTexture* compressed=o->compressed.texture.get();compressed&&decodePool.enabled()){
+            // the same bytes the render thread copies into the shadow (c.p0 lives until the command has run)
+            const size_t levelBytes=std::min<size_t>(compressed->bytes(0,level).size(),L.size);
+            c.p1=new DecodeJob{compressed->mode(),compressed->mipWidth(level),compressed->mipHeight(level),static_cast<const uint8_t*>(c.p0),levelBytes,{},{},false,false};
+            decodePool.submit(static_cast<DecodeJob*>(const_cast<void*>(c.p1)));
+        }
+        push(c);
     }
     freeGuest(L.guest);*count=2;*result=D3D_OK;return true;
 }
@@ -416,20 +503,20 @@ inline bool filterState(uint32_t method,const uint32_t* args,uint32_t* count){
     switch(method){
     case 57:*count=3;if(args[1]<256){if(sh.rsValid[args[1]]&&sh.rs[args[1]]==args[2])return true;sh.rs[args[1]]=args[2];sh.rsValid[args[1]]=true;}return false;
     case 65:*count=3;
-        if(args[1]<16){if(sh.texValid[args[1]]&&sh.tex[args[1]]==args[2]&&sh.texEpoch[args[1]]==objectsEpoch)return true;
-            sh.tex[args[1]]=args[2];sh.texEpoch[args[1]]=objectsEpoch;sh.texValid[args[1]]=true;}
+        if(args[1]<16){if(sh.texValid[args[1]]&&sh.tex[args[1]]==args[2]&&sh.texEpoch[args[1]]==handlesRetiredEpoch)return true;
+            sh.tex[args[1]]=args[2];sh.texEpoch[args[1]]=handlesRetiredEpoch;sh.texValid[args[1]]=true;}
         return false;
     case 67:*count=4;if(args[1]<8&&args[2]<33){uint32_t& v=sh.tss[args[1]][args[2]];bool& ok=sh.tssValid[args[1]][args[2]];
         if(ok&&v==args[3])return true;v=args[3];ok=true;}return false;
     case 69:*count=4;if(args[1]<16&&args[2]<16){uint32_t& v=sh.ss[args[1]][args[2]];bool& ok=sh.ssValid[args[1]][args[2]];
         if(ok&&v==args[3])return true;v=args[3];ok=true;}return false;
-    case 87:*count=2;if(sh.declValid&&sh.decl==args[1]&&sh.declE==objectsEpoch)return true;
-        sh.decl=args[1];sh.declE=objectsEpoch;sh.declValid=true;sh.fvfValid=false;return false;
+    case 87:*count=2;if(sh.declValid&&sh.decl==args[1]&&sh.declE==handlesRetiredEpoch)return true;
+        sh.decl=args[1];sh.declE=handlesRetiredEpoch;sh.declValid=true;sh.fvfValid=false;return false;
     case 89:*count=2;if(sh.fvfValid&&sh.fvf==args[1])return true;sh.fvf=args[1];sh.fvfValid=true;sh.declValid=false;return false;
-    case 92:*count=2;if(sh.vsValid&&sh.vs==args[1]&&sh.vsE==objectsEpoch)return true;
-        sh.vs=args[1];sh.vsE=objectsEpoch;sh.vsValid=true;return false;
-    case 107:*count=2;if(sh.psValid&&sh.ps==args[1]&&sh.psE==objectsEpoch)return true;
-        sh.ps=args[1];sh.psE=objectsEpoch;sh.psValid=true;return false;
+    case 92:*count=2;if(sh.vsValid&&sh.vs==args[1]&&sh.vsE==handlesRetiredEpoch)return true;
+        sh.vs=args[1];sh.vsE=handlesRetiredEpoch;sh.vsValid=true;return false;
+    case 107:*count=2;if(sh.psValid&&sh.ps==args[1]&&sh.psE==handlesRetiredEpoch)return true;
+        sh.ps=args[1];sh.psE=handlesRetiredEpoch;sh.psValid=true;return false;
     case 94:case 109:{*count=4;if(!args[2])return false;
         // Constants equal to what was last queued for those registers are dropped.
         const bool vs=method==94;const uint32_t limit=vs?256u:32u;
@@ -443,11 +530,11 @@ inline bool filterState(uint32_t method,const uint32_t* args,uint32_t* count){
         return false;}
     case 100:*count=5;
         if(args[1]<4){uint32_t* v=sh.sb[args[1]];
-            if(sh.sbValid[args[1]]&&v[0]==args[2]&&v[1]==args[3]&&v[2]==args[4]&&sh.sbE[args[1]]==objectsEpoch)return true;
-            v[0]=args[2];v[1]=args[3];v[2]=args[4];sh.sbE[args[1]]=objectsEpoch;sh.sbValid[args[1]]=true;}
+            if(sh.sbValid[args[1]]&&v[0]==args[2]&&v[1]==args[3]&&v[2]==args[4]&&sh.sbE[args[1]]==handlesRetiredEpoch)return true;
+            v[0]=args[2];v[1]=args[3];v[2]=args[4];sh.sbE[args[1]]=handlesRetiredEpoch;sh.sbValid[args[1]]=true;}
         return false;
-    case 104:*count=2;if(sh.ibValid&&sh.ib==args[1]&&sh.ibE==objectsEpoch)return true;
-        sh.ib=args[1];sh.ibE=objectsEpoch;sh.ibValid=true;return false;
+    case 104:*count=2;if(sh.ibValid&&sh.ib==args[1]&&sh.ibE==handlesRetiredEpoch)return true;
+        sh.ib=args[1];sh.ibE=handlesRetiredEpoch;sh.ibValid=true;return false;
     }
     return false;
 }
@@ -479,43 +566,42 @@ bool createBufferAsync(IUnknown* deviceObject,uint32_t method,const uint32_t* ar
     if(sh.dynamic)bufferShadows[handle]=sh;
     *count=7;*result=D3D_OK;++statAsyncCreates;return true;
 }
-bool tryDeferImpl(uint32_t kind,uint32_t method,const uint32_t* args,uint32_t* count,uint32_t* result){
-    *result=0;
-    if(!shadow)forgetShadow();
-    if(kind==2){
-        // The game has one device: remember its handle -> native mapping (objects is only modified by
-        // synchronous calls, on the render thread while this thread waits, and Release of the device).
-        static uint32_t cachedHandle=0;static IUnknown* cachedDevice=nullptr;static uint64_t cachedEpoch=~0ull;
-        const uint64_t curEpoch=objectsEpoch.load(std::memory_order_acquire);
-        if(args[0]!=cachedHandle||cachedEpoch!=curEpoch){
-            std::lock_guard<std::recursive_mutex> lock(objectsMutex);
-            auto found=objects.find(args[0]);if(found==objects.end()||found->second.kind!=Kind::Device)return false;
-            cachedHandle=args[0];cachedDevice=found->second.native;cachedEpoch=curEpoch;
-        }
-        if(method==26||method==27)return createBufferAsync(cachedDevice,method,args,count,result);
-        if(filterState(method,args,count)){++filtered;return true;}
-        Cmd c{};c.op=OpDevice;c.method=static_cast<uint16_t>(method);c.obj=cachedDevice;
-        for(int i=0;i<9;++i)c.a[i]=args[i];
+// ---- Textures created without waiting for the render thread ----
+// A world section load creates ~500 textures at once. Each CreateTexture was a synchronous call: the game thread
+// waited while the render thread drained the queue and allocated the whole GL mip chain (~2 ms per texture on the
+// device: a 1.4 s freeze, and hitches whenever streaming brings in a few). The GLES texture is created here with
+// its GL storage deferred to first use on the render thread (g_glesDeferTextureGL); the guest wrapper is made at
+// once. Render-target and depth textures keep the synchronous path. NFSU2_ASYNC_TEXTURES=0: synchronous as before.
+uint64_t statAsyncTextureCreates=0;
+static bool asyncTexturesOn(){static const bool on=[]{const char* e=std::getenv("NFSU2_ASYNC_TEXTURES");return !(e&&e[0]=='0');}();return on;}
+bool createTextureAsync(IUnknown* deviceObject,const uint32_t* args,uint32_t* count,uint32_t* result){
+    // CreateTexture(device, width, height, levels, usage, format, pool, out texture, shared handle)
+    const uint32_t width=args[1],height=args[2],levels=args[3],usage=args[4],outTexture=args[7],sharedHandle=args[8];
+    const auto requestedFormat=static_cast<D3DFORMAT>(args[5]);const auto pool=static_cast<D3DPOOL>(args[6]);
+    if(!asyncTexturesOn()||sharedHandle||!outTexture||!width||!height||(usage&(D3DUSAGE_RENDERTARGET|D3DUSAGE_DEPTHSTENCIL)))return false;
+    // nativeTextureFormat() without its device queries: the GLES device samples no DXT format (CPU decode to RGBA)
+    const D3DFORMAT nativeFormat=compressedFormat(requestedFormat)?D3DFMT_A8B8G8R8:requestedFormat;
+    auto device=static_cast<IDirect3DDevice9*>(deviceObject);IDirect3DTexture9* texture=nullptr;
+    g_glesDeferTextureGL=true;
+    const HRESULT status=device->CreateTexture(width,height,levels,usage,nativeFormat,pool,&texture,nullptr);
+    g_glesDeferTextureGL=false;
+    if(FAILED(status)||!texture)return false;
+    const uint32_t handle=wrap(texture,Kind::Texture);
+    if(nativeFormat!=requestedFormat){
+        std::lock_guard<std::recursive_mutex> lock(objectsMutex);
+        objects.at(handle).compressed.texture=std::make_shared<CompressedTexture>(requestedFormat,width,height,texture->GetLevelCount(),1);
+    }
+    write(outTexture,handle);*count=9;*result=D3D_OK;++statAsyncTextureCreates;return true;
+}
+// The game's device (one): its guest handle and native object, valid while handlesRetiredEpoch is unchanged.
+uint32_t deviceHandle=0;IUnknown* deviceNative=nullptr;uint64_t deviceHandleEpoch=~0ull;
+// A device method call queued for the render thread, after the redundant-call filter: every deferrable method but
+// Present and the resource creations. false = not deferrable here (the caller makes it a synchronous call).
+__attribute__((always_inline)) inline bool queueDeviceCall(uint32_t method,const uint32_t* args,uint32_t* count,IUnknown* device){
+    if(filterState(method,args,count)){++filtered;return true;}
+    Cmd c{};c.op=OpDevice;c.method=static_cast<uint16_t>(method);c.obj=device;
+    for(int i=0;i<9;++i)c.a[i]=args[i];
         switch(method){
-        case 17:{if(args[4])return false;*count=5;
-            static bool noted=false;if(!noted){noted=true;d3d9NoteGameThread();}
-            c.p0=args[1]?copyData(pointer(args[1]),sizeof(RECT)):nullptr;c.p1=args[2]?copyData(pointer(args[2]),sizeof(RECT)):nullptr;
-            c.obj2=dxvkAndroidGetWindowHandle();if(!c.obj2)return false;
-            flushRefDeltas();
-            uint64_t frame=presentsQueued.fetch_add(1)+1;push(c,true);
-            if(frame%240==0){static uint64_t f0=0,p0=0,s0=0;
-                std::fprintf(stderr,"[D3D9 queue] per frame: queued=%.0f filtered=%.0f sync=%.1f\n",(statPushed-p0)/240.0,(filtered-f0)/240.0,(statSyncs-s0)/240.0);
-                f0=filtered;p0=statPushed;s0=statSyncs;
-                std::vector<std::pair<uint32_t,uint32_t>> v(syncCounts.begin(),syncCounts.end());
-                std::sort(v.begin(),v.end(),[](auto&a,auto&b){return a.second>b.second;});
-                std::fprintf(stderr,"[D3D9 queue] synchronous calls per frame by method:");
-                for(size_t i=0;i<v.size()&&i<8;++i)std::fprintf(stderr," kind%u/m%u=%.1f",(v[i].first-methodBase)/4096,((v[i].first-methodBase)%4096)/16,v[i].second/240.0);
-                std::fprintf(stderr," (async buffer creates %llu, releases %llu so far)\n",(unsigned long long)statAsyncCreates,(unsigned long long)statAsyncReleases);syncCounts.clear();}
-            // At most one frame in flight: wait for the previous Present, then reuse its arena.
-            // The wait releases the guest machine so the game's other threads (sound) can run meanwhile.
-            d3d9BridgeWaitWithoutMachine([&]{nfsEmulatePace();waitDone([&]{return presentsDone.load(std::memory_order_acquire)+1>=frame;},50,0);});
-            arenaIndex^=1;arenas[arenaIndex].used=0;
-            return true;}
         case 3:*count=1;return true;  // TestCooperativeLevel: never lost here (was a synchronous call every frame)
         case 37:*count=3;c.obj2=cachedNative<IDirect3DSurface9>(args[2]);break;
         case 39:*count=2;c.obj2=cachedNative<IDirect3DSurface9>(args[1]);break;
@@ -555,6 +641,43 @@ bool tryDeferImpl(uint32_t kind,uint32_t method,const uint32_t* args,uint32_t* c
         default:return false;
         }
         ++statPushed;push(c);return true;
+}
+bool tryDeferImpl(uint32_t kind,uint32_t method,const uint32_t* args,uint32_t* count,uint32_t* result){
+    *result=0;
+    if(!shadow)forgetShadow();
+    if(kind==2){
+        // The game has one device: remember its handle -> native mapping (deviceHandle, deviceNative).
+        const uint64_t curEpoch=handlesRetiredEpoch.load(std::memory_order_acquire);
+        if(args[0]!=deviceHandle||deviceHandleEpoch!=curEpoch){
+            std::lock_guard<std::recursive_mutex> lock(objectsMutex);
+            auto found=objects.find(args[0]);if(found==objects.end()||found->second.kind!=Kind::Device)return false;
+            deviceHandle=args[0];deviceNative=found->second.native;deviceHandleEpoch=curEpoch;
+        }
+        if(method==26||method==27)return createBufferAsync(deviceNative,method,args,count,result);
+        if(method==23)return createTextureAsync(deviceNative,args,count,result);
+        if(method!=17)return queueDeviceCall(method,args,count,deviceNative);
+        // Present
+        Cmd c{};c.op=OpDevice;c.method=17;c.obj=deviceNative;
+        for(int i=0;i<9;++i)c.a[i]=args[i];
+        {if(args[4])return false;*count=5;
+            static bool noted=false;if(!noted){noted=true;d3d9NoteGameThread();}
+            c.p0=args[1]?copyData(pointer(args[1]),sizeof(RECT)):nullptr;c.p1=args[2]?copyData(pointer(args[2]),sizeof(RECT)):nullptr;
+            c.obj2=dxvkAndroidGetWindowHandle();if(!c.obj2)return false;
+            flushRefDeltas();
+            uint64_t frame=presentsQueued.fetch_add(1)+1;push(c,true);
+            if(frame%240==0){static uint64_t f0=0,p0=0,s0=0;
+                std::fprintf(stderr,"[D3D9 queue] per frame: queued=%.0f filtered=%.0f sync=%.1f\n",(statPushed-p0)/240.0,(filtered-f0)/240.0,(statSyncs-s0)/240.0);
+                f0=filtered;p0=statPushed;s0=statSyncs;
+                std::vector<std::pair<uint32_t,uint32_t>> v(syncCounts.begin(),syncCounts.end());
+                std::sort(v.begin(),v.end(),[](auto&a,auto&b){return a.second>b.second;});
+                std::fprintf(stderr,"[D3D9 queue] synchronous calls per frame by method:");
+                for(size_t i=0;i<v.size()&&i<8;++i)std::fprintf(stderr," kind%u/m%u=%.1f",(v[i].first-methodBase)/4096,((v[i].first-methodBase)%4096)/16,v[i].second/240.0);
+                std::fprintf(stderr," (async buffer creates %llu, releases %llu, texture creates %llu so far)\n",(unsigned long long)statAsyncCreates,(unsigned long long)statAsyncReleases,(unsigned long long)statAsyncTextureCreates);syncCounts.clear();}
+            // At most one frame in flight: wait for the previous Present, then reuse its arena.
+            // The wait releases the guest machine so the game's other threads (sound) can run meanwhile.
+            d3d9BridgeWaitWithoutMachine([&]{nfsEmulatePace();waitDone([&]{return presentsDone.load(std::memory_order_acquire)+1>=frame;},50,0);});
+            arenaIndex^=1;arenas[arenaIndex].used=0;
+            return true;}
     }
     // Descriptions (Surface GetDesc, texture GetLevelDesc) read immutable object data: answered on this
     // thread, without waiting for the render thread to drain the queue (they were synchronous every frame).
@@ -564,11 +687,10 @@ bool tryDeferImpl(uint32_t kind,uint32_t method,const uint32_t* args,uint32_t* c
     if(kind==3&&(method==19||method==20))return textureLockAsync(method,args,count,result);
     if((kind==6||kind==7)&&method==11)return lockBufferAsync(kind,args,count,result);
     if((kind==6||kind==7)&&method==12)return unlockBufferAsync(kind,args,count,result);
-    if(kind==11&&(method==4||method==5)){
-        std::lock_guard<std::recursive_mutex> lock(objectsMutex);
-        auto found=objects.find(args[0]);if(found==objects.end()||found->second.kind!=Kind::StateBlock)return false;
+    if(kind==11&&(method==4||method==5)){  // state block Capture / Apply (~120-150 a frame)
+        Object* block=cachedObject(args[0]);if(!block||block->kind!=Kind::StateBlock)return false;
         if(method==5)forgetShadow();  // Apply changes device state behind the shadow
-        Cmd c{};c.op=OpStateBlock;c.method=static_cast<uint16_t>(method);c.obj=found->second.native;*count=1;push(c);return true;
+        Cmd c{};c.op=OpStateBlock;c.method=static_cast<uint16_t>(method);c.obj=block->native;*count=1;push(c);return true;
     }
     // AddRef/Release: the guest-visible count is the bridge's own (see dispatchGuestD3D9Inner); only the
     // native count change is queued. Releases that retire the guest wrapper run synchronously.
@@ -579,7 +701,7 @@ bool tryDeferImpl(uint32_t kind,uint32_t method,const uint32_t* args,uint32_t* c
             if(o.references!=1||(kind!=6&&kind!=7)||o.children||o.parent||!asyncBuffersOn())return false;
             flushRefDeltas();                       // o may have a pending count change (refDirty points at it)
             IUnknown* native=o.native;
-            retireGuestObject(args[0]);             // erases o and its buffer shadow; bumps objectsEpoch
+            retireGuestObject(args[0]);             // erases o and its buffer shadow; bumps handlesRetiredEpoch
             Cmd c{};c.op=OpRelease;c.obj=native;push(c);
             *count=1;*result=0;++statAsyncReleases;return true;
         }
@@ -594,15 +716,15 @@ bool tryDeferImpl(uint32_t kind,uint32_t method,const uint32_t* args,uint32_t* c
 // runs every other frame. On the frames it runs, every D3D9 call it makes is recorded (method, arguments
 // and the bytes they point at; the shadow is forgotten first so no state call is filtered out of the
 // recording); on the frames in between the recording is replayed instead. A recording that contains
-// anything else (synchronous calls, locks, state blocks) or was made before an object was created or
-// released (objectsEpoch) is not replayed: the HUD then simply runs.
+// anything else (synchronous calls, locks, state blocks) is not replayed, nor one whose objects were released
+// since (checked when handlesRetiredEpoch moved): the HUD then simply runs.
 bool hudRecording=false;
 struct HudCall {uint32_t kind,method,a[9],off[2],len[2],arg[2];};
 struct HudRec {std::vector<HudCall> calls;std::vector<uint8_t> blob;std::vector<std::pair<uint32_t,IUnknown*>> objs;bool valid=false;uint64_t epoch=0;};
 HudRec hudRec;
 uint32_t hudScratch=0,hudScratchSize=0;
 void hudRecordInvalidate(){hudRec.valid=false;}
-void hudRecordBegin(){hudRec.calls.clear();hudRec.blob.clear();hudRec.objs.clear();hudRec.valid=true;hudRec.epoch=objectsEpoch;forgetShadow();hudRecording=true;}
+void hudRecordBegin(){hudRec.calls.clear();hudRec.blob.clear();hudRec.objs.clear();hudRec.valid=true;hudRec.epoch=handlesRetiredEpoch;forgetShadow();hudRecording=true;}
 void hudRecordEnd(){hudRecording=false;}
 static void hudData(HudCall& c,int slot,uint32_t argIndex,size_t bytes){
     c.arg[slot]=argIndex;c.len[slot]=0;c.off[slot]=0;
@@ -620,7 +742,7 @@ void hudRecordCall(uint32_t kind,uint32_t method,const uint32_t* args,bool defer
         hudRec.valid=false;return;
     }
     HudCall c{};c.kind=kind;c.method=method;for(int i=0;i<9;++i)c.a[i]=args[i];c.arg[0]=c.arg[1]=99;
-    // Objects the calls refer to: checked at replay instead of objectsEpoch (which changes whenever the
+    // Objects the calls refer to: checked at replay instead of handlesRetiredEpoch (which changes whenever the
     // world streams a texture in or out: the HUD then replayed on only ~40% of freeroam frames).
     auto obj=[&](uint32_t h){if(!h)return;Object* o=cachedObject(h);if(!o){hudRec.valid=false;return;}hudRec.objs.push_back({h,o->native});};
     switch(method){case 65:case 100:case 37:obj(args[2]);break;case 87:case 92:case 107:case 104:case 39:obj(args[1]);break;default:break;}
@@ -719,7 +841,7 @@ bool tryDefer(uint32_t kind,uint32_t method,const uint32_t* args,uint32_t* count
 }
 bool hudReplay(){
     if(!hudRec.valid||hudRec.calls.empty())return false;
-    const uint64_t curEpoch=objectsEpoch.load(std::memory_order_acquire);
+    const uint64_t curEpoch=handlesRetiredEpoch.load(std::memory_order_acquire);
     if(hudRec.epoch!=curEpoch){
         std::lock_guard<std::recursive_mutex> lock(objectsMutex);
         for(const auto& o:hudRec.objs){auto f=objects.find(o.first);if(f==objects.end()||f->second.native!=o.second)return false;}
@@ -764,6 +886,60 @@ extern "C" const void* nfsCapRecs(){return rt::capRecs.data();}
 extern "C" const uint8_t* nfsCapBytes(){return rt::capBytes.data();}
 extern "C" uint32_t nfsCapBytesSize(){return static_cast<uint32_t>(rt::capBytes.size());}
 // Any deferrable call by kind/method (args[0] = the object handle); 0 = not deferrable here.
+// ---- Shortcuts for device calls from the lifted code ----
+// Every D3D9 call from the game took the generic path: the arguments copied off the guest stack, the method decoded
+// from the call address, the recording hooks checked one by one, the call dispatched by kind and method. The call-site
+// cache (arm64_guest.h) keeps one handler per method address, so guest_runtime.cpp gives each device method its own
+// handler, which passes the guest stack straight here. The recording hooks run as tryDefer runs them (pass watch, HUD
+// recording, capture, in that order, for deferred calls); a device handle not seen yet goes the generic way.
+// NFSU2_D3D_SHORTCUTS=0: generic path only.
+extern "C" int nfsD3dShortcutsEnabled(){static const bool on=[]{const char* e=std::getenv("NFSU2_D3D_SHORTCUTS");return !(e&&e[0]=='0');}();return on;}
+// AddRef/Release of textures and buffers (D3DX changes a texture's count every time an effect sets it: ~1500 calls
+// a frame): the count change only, as tryDeferImpl does. A Release that would retire the object goes the generic way.
+extern "C" int nfsD3dReferenceShortcut(uint32_t kind,uint32_t method,const uint32_t* args,uint32_t* result){
+    using namespace rt;
+    if(!enabled)return 0;
+    Object* object=cachedObject(args[0]);if(!object||static_cast<uint32_t>(object->kind)!=kind)return 0;
+    if(method==2&&object->references<=1)return 0;
+    if(!object->refQueued){object->refQueued=true;refDirty.push_back(object);}
+    if(method==1){++object->refDelta;*result=++object->references;}else{--object->refDelta;*result=--object->references;}
+    if(passMode)passNote(kind,method,args,true);
+    if(hudRecording)hudRecordCall(kind,method,args,true);
+    if(capActive)capRecord(kind,method,args,true);
+    return 1;
+}
+// One instanced draw for consecutive replayed world items with the same mesh (src/runtime/world_cull.c replayGroup):
+// dip = the DrawIndexedPrimitive arguments after the device, registers = the vertex-shader registers that follow the
+// world matrix, data = instances x registers vec4. The filter's shadow ends with the last instance's values, as the
+// device's register file does. 0 = not queued (render thread off, or something is being recorded): draw them singly.
+extern "C" int nfsD3dDrawInstanced(const uint32_t* dip,uint32_t registerCount,const uint16_t* registers,uint32_t instances,const float* data){
+    using namespace rt;
+    static const bool off=[]{const char* e=std::getenv("NFSU2_INSTANCING");return e&&e[0]=='0';}();
+    if(off||!enabled||!shadow||!deviceNative||passMode||hudRecording||capActive||!registerCount||registerCount>16||instances<2||instances>64)return 0;
+    const size_t dataBytes=size_t(instances)*registerCount*16,payloadBytes=instanceDataOffset(registerCount)+dataBytes;
+    std::vector<uint8_t>& payload=instancePayload;payload.assign(payloadBytes,0);
+    std::memcpy(payload.data(),registers,size_t(registerCount)*2);
+    std::memcpy(payload.data()+instanceDataOffset(registerCount),data,dataBytes);
+    Cmd c{};c.op=OpInstancedDraw;c.obj=deviceNative;
+    for(int i=0;i<6;++i)c.a[i]=dip[i];
+    c.a[6]=registerCount;c.a[7]=instances;c.p0=copyData(payload.data(),payloadBytes);
+    for(uint32_t j=0;j<registerCount;++j){
+        const uint32_t reg=registers[j];if(reg>=256)continue;
+        std::memcpy(shadow->vsc[reg],data+(size_t(instances-1)*registerCount+j)*4,16);shadow->vscValid[reg]=true;
+    }
+    ++statPushed;push(c);return 1;
+}
+extern "C" int nfsD3dDeviceCallShortcut(uint32_t method,const uint32_t* args,uint32_t* count){
+    using namespace rt;
+    if(!enabled||!shadow)return 0;
+    if(args[0]!=deviceHandle||deviceHandleEpoch!=handlesRetiredEpoch.load(std::memory_order_acquire))return 0;
+    if(method==17||method==23||method==26||method==27)return 0;   // Present and the creations: generic path
+    if(!queueDeviceCall(method,args,count,deviceNative))return 0;
+    if(passMode)passNote(2,method,args,true);
+    if(hudRecording)hudRecordCall(2,method,args,true);
+    if(capActive)capRecord(2,method,args,true);
+    return 1;
+}
 extern "C" int nfsD3dCall(uint32_t kind,uint32_t method,const uint32_t* args){
     if(!rt::enabled)return 0;
     uint32_t a[12]={};std::memcpy(a,args,9*sizeof(uint32_t));uint32_t count=0,result=0;
