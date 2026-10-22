@@ -102,13 +102,22 @@ void enqueueGuestText(const std::vector<uint32_t>& characters){
 }
 // Touch as mouse: Android writes the pointer as a fraction of the game view; it is
 // turned into client coordinates of the active window under the machine lock.
+#if defined(NFS_R36S)
+// No pointer device on the handhelds: the game's cursor rests on the window's last pixel, so its arrow is drawn
+// off-screen (a centred default made the front end draw its mouse cursor in the middle of every menu).
+std::atomic<float> guestPointerX{1.0f},guestPointerY{1.0f};
+#else
 std::atomic<float> guestPointerX{0.5f},guestPointerY{0.5f};
+#endif
 constexpr uint32_t pointerPending=0xffffffffu;  // lParam placeholder of queued mouse messages
 uint32_t captureWindow{};
 std::pair<int32_t,int32_t> pointerInWindow(){
     auto window=windows.find(activeWindow);
     if(window==windows.end())return {0,0};
     int32_t width=std::max(window->second.width,1),height=std::max(window->second.height,1);
+#if defined(NFS_R36S)
+    return {width+64,height+64};   // no pointer: just outside the window, so no part of the arrow is drawn
+#endif
     return {std::min(int32_t(guestPointerX.load()*float(width)),width-1),std::min(int32_t(guestPointerY.load()*float(height)),height-1)};
 }
 void enqueueGuestPointer(int phase){  // 0 down, 1 move, 2 up
