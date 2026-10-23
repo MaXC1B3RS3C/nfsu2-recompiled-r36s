@@ -2,6 +2,13 @@ std::string guestWorkingDirectory="C:\\nfsu2";
 void logicalDrives(){ret(4,0);}
 void driveType(){auto path=lower(guestString(arg(0)));ret(path.empty()||path.rfind("c:",0)==0?3:1,1);}
 uint32_t fileError(){switch(errno){case ENOENT:return 2;case EACCES:case EPERM:return 5;case EEXIST:return 80;case ENOSPC:return 112;case EBADF:return 6;default:return 1;}}
+// Guest paths resolved case-insensitively, keyed by the lower-case path inside the game folder. The game opens its
+// stream archive (STREAML4RA.BUN) many times a second while driving; each resolution listed every directory on the
+// way and canonicalised the result (~2% of the game thread in the VM, more on an SD card). Only paths whose every
+// component exists are kept, so creating files cannot make an entry wrong; deleting, removing or moving clears it.
+std::mutex resolvedGamePathsMutex;
+std::unordered_map<std::string,std::filesystem::path> resolvedGamePaths;
+void forgetResolvedGamePaths(){std::lock_guard<std::mutex> lock(resolvedGamePathsMutex);resolvedGamePaths.clear();}
 std::filesystem::path gamePath(std::string guest){
     std::replace(guest.begin(),guest.end(),'\\','/');auto normalized=lower(guest);
     if(normalized=="c:/nfsu2")guest.clear();
@@ -9,13 +16,17 @@ std::filesystem::path gamePath(std::string guest){
     else if(guest.find(':')!=std::string::npos||guest.rfind("//",0)==0)throw GuestStop("Unsupported guest path: "+guest);
     else {if(!guest.empty()&&guest.front()=='/')guest.erase(0,1);else{auto current=guestWorkingDirectory.substr(8);std::replace(current.begin(),current.end(),'\\','/');if(!current.empty())guest=current+"/"+guest;}}
     auto relative=std::filesystem::path(guest).lexically_normal();for(const auto& part:relative)if(part=="..")throw GuestStop("Guest path leaves nfsu2: "+guest);
-    auto result=std::filesystem::path(hostGameRoot);
+    const std::string cacheKey=lower(relative.generic_string());
+    {std::lock_guard<std::mutex> lock(resolvedGamePathsMutex);auto cached=resolvedGamePaths.find(cacheKey);if(cached!=resolvedGamePaths.end())return cached->second;}
+    auto result=std::filesystem::path(hostGameRoot);bool everyPartExists=true;
     for(const auto& part:relative){if(part==".")continue;std::error_code error;bool found=false;
         for(auto& entry:std::filesystem::directory_iterator(result,error))if(lower(entry.path().filename().string())==lower(part.string())){result=entry.path();found=true;break;}
-        if(!found)result/=part;
+        if(!found){result/=part;everyPartExists=false;}
     }
     auto root=std::filesystem::weakly_canonical(hostGameRoot);auto resolved=std::filesystem::weakly_canonical(result);
-    auto check=resolved.lexically_relative(root);for(const auto& part:check)if(part=="..")throw GuestStop("Guest symlink leaves data root");return resolved;
+    auto check=resolved.lexically_relative(root);for(const auto& part:check)if(part=="..")throw GuestStop("Guest symlink leaves data root");
+    if(everyPartExists){std::lock_guard<std::mutex> lock(resolvedGamePathsMutex);resolvedGamePaths.emplace(cacheKey,resolved);}
+    return resolved;
 }
 std::map<uint32_t,int> fileHandles;uint32_t nextFileHandle=0xf0060000;
 // The game skips its CD-drive check when the game folder holds a file named
@@ -157,18 +168,18 @@ void fullPathName(){
 void deleteFile(){
     auto path=gamePath(guestString(arg(0)));
     if(::unlink(path.c_str())){lastError=fileError();ret(0,1);return;}
-    lastError=0;ret(1,1);
+    forgetResolvedGamePaths();lastError=0;ret(1,1);
 }
 void removeDirectory(){
     auto path=gamePath(guestString(arg(0)));
     if(::rmdir(path.c_str())){lastError=errno==ENOTEMPTY||errno==EEXIST?145:fileError();ret(0,1);return;}  // ERROR_DIR_NOT_EMPTY
-    lastError=0;ret(1,1);
+    forgetResolvedGamePaths();lastError=0;ret(1,1);
 }
 void moveFile(){
     auto from=gamePath(guestString(arg(0))),to=gamePath(guestString(arg(1)));
     struct stat status{};if(!::stat(to.c_str(),&status)){lastError=183;ret(0,2);return;}  // ERROR_ALREADY_EXISTS
     if(::rename(from.c_str(),to.c_str())){lastError=fileError();ret(0,2);return;}
-    lastError=0;ret(1,2);
+    forgetResolvedGamePaths();lastError=0;ret(1,2);
 }
 // GetFileTime(handle, creation, access, write): FILETIME is 100 ns ticks since 1601.
 void fileTime(){

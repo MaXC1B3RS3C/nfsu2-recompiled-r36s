@@ -17,6 +17,7 @@
 #include "d3d9_gles.h"
 #include "../../../third_party/mojoshader/mojoshader.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -48,8 +49,35 @@ struct ShaderSamplerInfo {
     MOJOSHADER_samplerType type;
 };
 
+// ---- Instanced vertex-shader variants (world draw replay, src/runtime/world_cull.c) ----
+// Consecutive replayed world items that draw the same mesh differ only in the constant registers that follow their
+// world matrix. One instanced draw covers them: the variant reads those registers from nfs_inst[base + j] with
+// base = instance * k (a uniform array: GLSL ES 1.00 allows any index into vertex-shader uniforms), the instance
+// number coming from one per-instance attribute (divisor 1). The rest of the translation, and the pixel shaders,
+// are unchanged. A layout is the list of instanced registers; variant key = bgra mask | layout id << 16 | bit 31.
+constexpr uint32_t kInstancedVariantBit = 1u << 31;
+constexpr int kMaxInstancesPerDraw = 64;
+constexpr int kMaxInstanceRegisters = 16;
+// GL_MAX_VERTEX_UNIFORM_VECTORS (set when instancing starts). An instanced variant's nfs_inst array takes what the
+// shader's own constants (at most 256 vectors) leave: instances per draw = that room / registers, at most 64.
+inline int& maxVertexUniformVectors() { static int vectors = 0; return vectors; }
+inline int instancesPerDraw(int registerCount) {
+    if (registerCount <= 0) return 0;
+    return std::min(kMaxInstancesPerDraw, std::max(0, (maxVertexUniformVectors() - 256 - 8) / registerCount));
+}
+inline std::vector<std::vector<uint16_t>>& instanceLayouts() { static std::vector<std::vector<uint16_t>> layouts; return layouts; }
+// 1-based id of a register list (render thread only)
+inline uint32_t instanceLayoutId(const uint16_t* registers, uint32_t count) {
+    auto& layouts = instanceLayouts();
+    for (size_t i = 0; i < layouts.size(); ++i)
+        if (layouts[i].size() == count && std::equal(registers, registers + count, layouts[i].begin())) return static_cast<uint32_t>(i + 1);
+    layouts.emplace_back(registers, registers + count);
+    return static_cast<uint32_t>(layouts.size());
+}
+
 struct ShaderVariant {
     GLuint glShader = 0;
+    int instanceRegisterCount = 0;  // > 0: instanced variant (uniform nfs_inst, attribute nfs_instance_in after the others)
     std::string source;
     std::vector<ShaderUniformInfo> uniforms;  // non-constant uniforms in MojoShader emission order
     std::vector<ShaderAttributeInfo> attributes;
@@ -92,8 +120,13 @@ struct ProgramBinaryCache {
             std::printf("[D3D9 GLES] program binary cache unavailable (extension %d, formats %d)\n", ext && std::strstr(ext, "GL_OES_get_program_binary") ? 1 : 0, formats);
             return;
         }
+#ifdef __ANDROID__
+        get = reinterpret_cast<GetBinary>(eglGetProcAddress("glGetProgramBinaryOES"));
+        load = reinterpret_cast<LoadBinary>(eglGetProcAddress("glProgramBinaryOES"));
+#else
         get = reinterpret_cast<GetBinary>(SDL_GL_GetProcAddress("glGetProgramBinaryOES"));
         load = reinterpret_cast<LoadBinary>(SDL_GL_GetProcAddress("glProgramBinaryOES"));
+#endif
         if (!get || !load) return;
         mkdir(dir.c_str(), 0755);
         const char* r = reinterpret_cast<const char*>(glGetString(GL_RENDERER));
@@ -312,6 +345,30 @@ private:
 
         if (m_type == GL_VERTEX_SHADER) {
             std::string prologue;
+            if (key & kInstancedVariantBit) {
+                const uint32_t layoutId = (key >> 16) & 0x7FFFu;
+                if (!layoutId || layoutId > instanceLayouts().size()) return;
+                const std::vector<uint16_t>& registers = instanceLayouts()[layoutId - 1];
+                // Relative addressing (vs_uniforms_vec4[a0 + n]) could read an instanced register: no variant.
+                for (size_t p = src.find("vs_uniforms_vec4["); p != std::string::npos; p = src.find("vs_uniforms_vec4[", p + 1)) {
+                    size_t q = p + std::strlen("vs_uniforms_vec4[");
+                    while (q < src.size() && src[q] >= '0' && src[q] <= '9') ++q;
+                    if (q >= src.size() || src[q] != ']') return;
+                }
+                for (size_t j = 0; j < registers.size(); ++j) {
+                    const std::string define = "#define vs_c" + std::to_string(registers[j]) + " ";
+                    const size_t d = src.find(define);
+                    if (d == std::string::npos) continue;   // the shader does not read this register
+                    const size_t e = src.find('\n', d);
+                    src.replace(d, e - d, define + "nfs_inst[nfs_instanceBase + " + std::to_string(j) + "]");
+                }
+                const std::string k = std::to_string(registers.size());
+                if (instancesPerDraw(static_cast<int>(registers.size())) < 2) return;
+                src.insert(src.find("void main()"), "uniform vec4 nfs_inst[" + std::to_string(instancesPerDraw(static_cast<int>(registers.size())) * static_cast<int>(registers.size())) +
+                           "];\nattribute float nfs_instance_in;\nint nfs_instanceBase;\n");
+                prologue += "\tnfs_instanceBase = int(nfs_instance_in + 0.5) * " + k + ";\n";
+                v.instanceRegisterCount = static_cast<int>(registers.size());
+            }
             // D3D9 vertex colour outputs that the shader never writes read as opaque white.
             if (src.find("io_10_0") != std::string::npos && src.find("vs_oD0 =") == std::string::npos) {
                 prologue += "\tio_10_0 = vec4(1.0);\n";
@@ -574,6 +631,7 @@ struct LinkedProgram {
     GLint vpFlipLoc = -1, alphaTestLoc = -1;
     GLint wvpLoc = -1, rhwLoc = -1, tfactorLoc = -1;
     GLint fogColorLoc = -1, fogParamsLoc = -1, fogRadLoc = -1;
+    GLint instanceRegistersLoc = -1;  // nfs_inst of an instanced vertex-shader variant
     float lastFogRad[4] = {-1, -1, -1, -1};
     float lastFog[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
     std::vector<float> vsFloatShadow, psFloatShadow;
@@ -667,6 +725,7 @@ public:
             for (size_t i = 0; i < vs->attributes.size(); ++i) {
                 glBindAttribLocation(prog, static_cast<GLuint>(i), vs->attributes[i].name.c_str());
             }
+            if (vs->instanceRegisterCount) glBindAttribLocation(prog, static_cast<GLuint>(vs->attributes.size()), "nfs_instance_in");
         } else {
             glBindAttribLocation(prog, kFFPPos, "a_pos");
             glBindAttribLocation(prog, kFFPDiffuse, "a_diffuse");
@@ -716,6 +775,7 @@ public:
             lp.vsFloatLoc = glGetUniformLocation(prog, "vs_uniforms_vec4");
             lp.vsIntLoc = glGetUniformLocation(prog, "vs_uniforms_ivec4");
             lp.vsBoolLoc = glGetUniformLocation(prog, "vs_uniforms_bool");
+            if (vs->instanceRegisterCount) lp.instanceRegistersLoc = glGetUniformLocation(prog, "nfs_inst");
             lp.vsFloatShadow.assign(vs->float4Count * 4, 0.0f);
             lp.vsIntShadow.assign(vs->int4Count * 4, 0);
             lp.vsBoolShadow.assign(vs->boolCount, 0);

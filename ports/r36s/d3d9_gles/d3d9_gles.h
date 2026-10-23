@@ -1,8 +1,20 @@
 #pragma once
 
 #include <d3d9.h>
+#ifdef __ANDROID__
+#include <EGL/egl.h>
+#include <EGL/eglext.h>
+#include <GLES2/gl2.h>
+#include <GLES2/gl2ext.h>
+#include <GLES3/gl3.h>
+#include <android/native_window.h>
+#include <android/log.h>
+struct SDL_Window;
+typedef void* SDL_GLContext;
+#else
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_opengles2.h>
+#endif
 #include "gl_state_cache.h"
 
 #include <atomic>

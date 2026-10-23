@@ -17,7 +17,9 @@ extern "C" bool nfsParallelGuest();  // guest_runtime.cpp: guest threads run in 
 #include <csignal>
 #include <chrono>
 #include <dirent.h>
+#if !defined(__ANDROID__)
 #include <execinfo.h>
+#endif
 #include <sys/resource.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
@@ -34,6 +36,7 @@ extern "C" bool nfsParallelGuest();  // guest_runtime.cpp: guest threads run in 
 
 // Global (not in any namespace): d3d9_gles_resources.h and the D3D9 bridge refer to it.
 thread_local bool g_glesDeferBufferGL = false;
+thread_local bool g_glesDeferTextureGL = false;
 
 // Panel rotation in degrees (0, 90, 270), set by the host before the device exists (main.cpp, NFSU2_ROTATE).
 uint32_t g_nfsScreenRotation = 0;
@@ -77,12 +80,16 @@ struct SegvTraceInstaller {
         struct sigaction sa{};
         sa.sa_flags = SA_SIGINFO | SA_RESETHAND;
         sa.sa_sigaction = [](int, siginfo_t* info, void*) {
+#if !defined(__ANDROID__)
             void* frames[64];
             int n = backtrace(frames, 64);
             char msg[96];
             int len = std::snprintf(msg, sizeof(msg), "\n[SEGV] fault address %p\n", info ? info->si_addr : nullptr);
             if (len > 0) { ssize_t w = write(2, msg, static_cast<size_t>(len)); (void)w; }
             backtrace_symbols_fd(frames, n, 2);
+#else
+            (void)info;
+#endif
         };
         sigaction(SIGSEGV, &sa, nullptr);
     }
@@ -102,12 +109,14 @@ struct HangWatchdog {
         struct sigaction sa{};
         sa.sa_flags = SA_RESTART;
         sa.sa_handler = [](int) {
+#if !defined(__ANDROID__)
             void* frames[48];
             int n = backtrace(frames, 48);
             char msg[64];
             int len = std::snprintf(msg, sizeof(msg), "\n[HANG] thread %ld:\n", static_cast<long>(syscall(SYS_gettid)));
             if (len > 0) { ssize_t w = write(2, msg, static_cast<size_t>(len)); (void)w; }
             backtrace_symbols_fd(frames, n, 2);
+#endif
         };
         sigaction(SIGUSR2, &sa, nullptr);
         g_lastPresentMs = nowMs();
@@ -170,9 +179,13 @@ void wallHandler(int, siginfo_t*, void*) {
     if (!g_profOn.load(std::memory_order_relaxed)) return;
     const int i = g_wallCount.fetch_add(1, std::memory_order_relaxed);
     if (i >= kWallMax) return;
+#if !defined(__ANDROID__)
     void* frames[kWallDepth + 2] = {};
     const int n = backtrace(frames, kWallDepth + 2);
     for (int k = 0; k < kWallDepth; ++k) g_wall[i][k] = k + 2 < n ? reinterpret_cast<uint64_t>(frames[k + 2]) : 0;  // skip handler + trampoline
+#else
+    (void)i;
+#endif
 }
 void profileWrite(int first, int last) {
     {
@@ -225,7 +238,9 @@ void profileFrame(uint32_t frame, uint32_t draws) {
             wa.sa_flags = SA_SIGINFO | SA_RESTART;
             wa.sa_sigaction = wallHandler;
             sigaction(SIGRTMIN + 3, &wa, nullptr);
+#if !defined(__ANDROID__)
             { void* warm[4]; backtrace(warm, 4); }
+#endif
         }
     }
     if (first < 0) return;
@@ -284,7 +299,7 @@ void profileFrame(uint32_t frame, uint32_t draws) {
         g_profOn = false;
         // Written in the background: formatting ~28k stacks took the presenting thread over a second
         // (a visible freeze in the v14 device test).
-        std::thread([first, last] { profileWrite(first, last); }).detach();
+        std::thread([] { profileWrite(first, last); }).detach();
     }
 }
 
@@ -440,8 +455,24 @@ void gpuLoadFrame(uint32_t frame) {
         }
     }
 }
+// GPU time per frame, measured directly: on 8 frames out of every 240 the presenting thread waits for the GPU to
+// finish the frame (glFinish) before swapping. "finish" is the GPU work still outstanding once the frame's commands
+// are issued; "swap after finish" is then only the wait for the display (vsync). Without the probe that sum shows as
+// SwapWindow time and cannot be told apart. NFSU2_GPU_PROBE=0 disables it.
+struct GpuFinishProbe { double finishMs = 0, swapMs = 0; int frames = 0; };
+GpuFinishProbe& gpuFinishProbe() { static GpuFinishProbe p; return p; }
+bool gpuFinishProbeFrame(uint32_t frame) {
+    static const bool off = std::getenv("NFSU2_GPU_PROBE") && std::getenv("NFSU2_GPU_PROBE")[0] == '0';
+    return !off && frame > 300 && frame % 240 < 8;
+}
 // Called with the PERF line (every `frames` frames).
 void gpuLoadReport(uint32_t frames, double wallMsPerFrame) {
+    GpuFinishProbe& probe = gpuFinishProbe();
+    if (probe.frames) {
+        std::printf("[NFSU2 GPU] probe over %d frames: GPU finish %.1f ms/frame after the commands were issued, swap after finish %.1f ms/frame\n",
+                    probe.frames, probe.finishMs / probe.frames, probe.swapMs / probe.frames);
+        probe = GpuFinishProbe{};
+    }
     GpuLoad& g = gpuLoad();
     if (g.kind < 0) return;
     std::string freq;
@@ -594,6 +625,7 @@ int traceFrame() {
 
 // Global WSI functions called by guest_runtime / d3d9_bridge
 extern "C" {
+#if defined(NFS_R36S)
 IDirect3D9* Direct3DCreate9(UINT sdk) {
     std::printf("[D3D9 GLES] Direct3DCreate9 initialized for OpenGL ES 2.0 / Mali-G31 (SDK=%u)\n", sdk);
     return new d3d9_gles::IDirect3D9GLES();
@@ -615,6 +647,29 @@ void dxvkAndroidSetRenderSize(uint32_t width, uint32_t height) {
     g_renderWidth = width;
     g_renderHeight = height;
 }
+#else
+IDirect3D9* Direct3DCreate9_GLES(UINT sdk) {
+    std::printf("[D3D9 GLES] Direct3DCreate9 initialized for OpenGL ES 2.0 / 3.0 (SDK=%u)\n", sdk);
+    return new d3d9_gles::IDirect3D9GLES();
+}
+
+void glesAndroidSetWindow(void* window) {
+    std::lock_guard<std::mutex> lock(g_windowMutex);
+    g_hostWindow = window;
+    g_windowHandle = reinterpret_cast<HWND>(window);
+}
+
+HWND glesAndroidGetWindowHandle() {
+    std::lock_guard<std::mutex> lock(g_windowMutex);
+    return g_windowHandle;
+}
+
+void glesAndroidSetRenderSize(uint32_t width, uint32_t height) {
+    std::lock_guard<std::mutex> lock(g_windowMutex);
+    g_renderWidth = width;
+    g_renderHeight = height;
+}
+#endif
 }
 
 extern "C" ptrdiff_t g_mem_base;
@@ -743,6 +798,70 @@ IDirect3DDevice9GLES::IDirect3DDevice9GLES(IDirect3D9GLES* parentD3D, SDL_Window
     if (m_parentD3D) m_parentD3D->AddRef();
     glesCurrentDevice() = this;
 
+#ifdef __ANDROID__
+    ANativeWindow* aWindow = g_hostWindow ? reinterpret_cast<ANativeWindow*>(g_hostWindow) : nullptr;
+    if (aWindow) {
+        m_eglDisplay = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+        if (m_eglDisplay == EGL_NO_DISPLAY) {
+            std::fprintf(stderr, "[D3D9 GLES] eglGetDisplay failed\n");
+        } else {
+            EGLint major = 0, minor = 0;
+            if (!eglInitialize(m_eglDisplay, &major, &minor)) {
+                std::fprintf(stderr, "[D3D9 GLES] eglInitialize failed\n");
+            } else {
+                const EGLint attribs[] = {
+                    EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+                    EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
+                    EGL_RED_SIZE, 8,
+                    EGL_GREEN_SIZE, 8,
+                    EGL_BLUE_SIZE, 8,
+                    EGL_ALPHA_SIZE, 8,
+                    EGL_DEPTH_SIZE, 24,
+                    EGL_STENCIL_SIZE, 8,
+                    EGL_NONE
+                };
+                EGLint numConfigs = 0;
+                if (!eglChooseConfig(m_eglDisplay, attribs, &m_eglConfig, 1, &numConfigs) || numConfigs < 1) {
+                    const EGLint fallbackAttribs[] = {
+                        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+                        EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
+                        EGL_RED_SIZE, 8,
+                        EGL_GREEN_SIZE, 8,
+                        EGL_BLUE_SIZE, 8,
+                        EGL_DEPTH_SIZE, 24,
+                        EGL_STENCIL_SIZE, 8,
+                        EGL_NONE
+                    };
+                    eglChooseConfig(m_eglDisplay, fallbackAttribs, &m_eglConfig, 1, &numConfigs);
+                }
+
+                EGLint format = 0;
+                eglGetConfigAttrib(m_eglDisplay, m_eglConfig, EGL_NATIVE_VISUAL_ID, &format);
+                ANativeWindow_setBuffersGeometry(aWindow, 0, 0, format);
+                m_eglSurface = eglCreateWindowSurface(m_eglDisplay, m_eglConfig, aWindow, nullptr);
+
+                const EGLint ctxAttribs[] = {
+                    EGL_CONTEXT_CLIENT_VERSION, 2,
+                    EGL_NONE
+                };
+                m_eglContext = eglCreateContext(m_eglDisplay, m_eglConfig, EGL_NO_CONTEXT, ctxAttribs);
+                if (m_eglContext != EGL_NO_CONTEXT) {
+                    eglMakeCurrent(m_eglDisplay, m_eglSurface, m_eglSurface, m_eglContext);
+                    eglSwapInterval(m_eglDisplay, 1);
+                    std::printf("[D3D9 GLES] EGL & GLES 2.0 Context initialized successfully on Android!\n");
+                    std::printf("  GL_VENDOR:   %s\n", glGetString(GL_VENDOR));
+                    std::printf("  GL_RENDERER: %s\n", glGetString(GL_RENDERER));
+                    std::printf("  GL_VERSION:  %s\n", glGetString(GL_VERSION));
+                    __android_log_print(ANDROID_LOG_INFO, "NFSU2", "[D3D9 GLES] GPU: %s | %s | %s",
+                        glGetString(GL_VENDOR), glGetString(GL_RENDERER), glGetString(GL_VERSION));
+                } else {
+                    std::fprintf(stderr, "[D3D9 GLES] eglCreateContext failed: 0x%X\n", eglGetError());
+                    __android_log_print(ANDROID_LOG_ERROR, "NFSU2", "[D3D9 GLES] eglCreateContext failed: 0x%X", eglGetError());
+                }
+            }
+        }
+    }
+#else
     if (m_sdlWindow) {
         SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
         SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 2);
@@ -773,6 +892,7 @@ IDirect3DDevice9GLES::IDirect3DDevice9GLES(IDirect3D9GLES* parentD3D, SDL_Window
             std::fprintf(stderr, "[D3D9 GLES] Failed to create SDL GLES context: %s\n", SDL_GetError());
         }
     }
+#endif
 
     GLESCaps& caps = glesCaps();
     caps.npot = hasGLExtension("GL_OES_texture_npot") || hasGLExtension("GL_ARB_texture_non_power_of_two");
@@ -906,7 +1026,23 @@ IDirect3DDevice9GLES::~IDirect3DDevice9GLES() {
     destroyBackBufferTarget();
     if (m_defaultBackBuffer) m_defaultBackBuffer->Release();
     if (m_defaultDepthBuffer) m_defaultDepthBuffer->Release();
+#ifdef __ANDROID__
+    if (m_eglDisplay != EGL_NO_DISPLAY) {
+        eglMakeCurrent(m_eglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+        if (m_eglContext != EGL_NO_CONTEXT) {
+            eglDestroyContext(m_eglDisplay, m_eglContext);
+            m_eglContext = EGL_NO_CONTEXT;
+        }
+        if (m_eglSurface != EGL_NO_SURFACE) {
+            eglDestroySurface(m_eglDisplay, m_eglSurface);
+            m_eglSurface = EGL_NO_SURFACE;
+        }
+        eglTerminate(m_eglDisplay);
+        m_eglDisplay = EGL_NO_DISPLAY;
+    }
+#else
     if (m_glContext && m_sdlWindow) SDL_GL_DeleteContext(m_glContext);
+#endif
     if (m_parentD3D) m_parentD3D->Release();
 }
 
@@ -1147,12 +1283,22 @@ extern "C" void d3d9NoteGameThread() {
     pthread_setname_np(pthread_self(), "game");
 }
 
+#if defined(NFS_R36S)
 extern "C" uint32_t getD3D9PresentCount() {
     return g_d3d9PresentCount.load(std::memory_order_relaxed);
 }
+#else
+extern "C" uint32_t glesGetD3D9PresentCount() {
+    return g_d3d9PresentCount.load(std::memory_order_relaxed);
+}
+#endif
 
 STDMETHODIMP IDirect3DDevice9GLES::Present(const RECT* pSourceRect, const RECT* pDestRect, HWND hDestWindowOverride, const RGNDATA* pDirtyRegion) {
+#ifdef __ANDROID__
+    if (!g_hostWindow) return D3D_OK;
+#else
     if (!m_sdlWindow) return D3D_OK;
+#endif
     const uint32_t frame = ++g_d3d9PresentCount;
     if (frame == 1 && !g_gameTid.load()) {  // no render thread: the presenting thread is the game's
         g_gameTid = static_cast<long>(syscall(SYS_gettid));
@@ -1313,8 +1459,12 @@ STDMETHODIMP IDirect3DDevice9GLES::Present(const RECT* pSourceRect, const RECT* 
         std::printf("\n");
     }
     static const bool captureDiagnosticFrames = std::getenv("NFSU2_DIAG_FRAMES") != nullptr;
+    // Frames 0..800 every 10: the boot/loading screen, the EA Games / THX / legal-screen intro quads and
+    // the front-end menus all live there. The old sparse list started at frame 30 and jumped 400 -> 600, so
+    // those screens (and the two quad siblings that only draw during the intro) were never captured.
     if (captureDiagnosticFrames &&
-        ((frame <= 1800 && (frame == 30 || frame == 60 || frame == 180 || frame == 400 || frame == 600 ||
+        ((frame <= 800 && frame % 10 == 0) ||
+         (frame <= 1800 && (frame == 30 || frame == 60 || frame == 180 || frame == 400 || frame == 600 ||
                             frame == 800 || frame == 1000 || frame == 1150 || frame == 1250 || frame == 1400 ||
                             frame == 1600 || frame == 1800)) ||
          (frame > 1800 && frame <= 2450 && (frame % 50 == 0 || frame == 2401)))) {
@@ -1344,9 +1494,24 @@ STDMETHODIMP IDirect3DDevice9GLES::Present(const RECT* pSourceRect, const RECT* 
     if (m_bbFbo) presentBackBuffer();
     {
         glsc::DriverCpuTimer timer;
-        const auto t0 = std::chrono::steady_clock::now();
+        const bool probeGpu = gpuFinishProbeFrame(frame);
+        auto t0 = std::chrono::steady_clock::now();
+        if (probeGpu) {
+            glFinish();
+            const auto finished = std::chrono::steady_clock::now();
+            gpuFinishProbe().finishMs += std::chrono::duration<double, std::milli>(finished - t0).count();
+            t0 = finished;
+        }
+#ifdef __ANDROID__
+        if (m_eglDisplay != EGL_NO_DISPLAY && m_eglSurface != EGL_NO_SURFACE) {
+            eglSwapBuffers(m_eglDisplay, m_eglSurface);
+        }
+#else
         SDL_GL_SwapWindow(m_sdlWindow);
-        nfsWaitAdd(3, std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+#endif
+        const auto swapped = std::chrono::steady_clock::now();
+        if (probeGpu) { gpuFinishProbe().swapMs += std::chrono::duration<double, std::milli>(swapped - t0).count(); ++gpuFinishProbe().frames; }
+        nfsWaitAdd(3, std::chrono::duration_cast<std::chrono::nanoseconds>(swapped - t0).count());
     }
     return D3D_OK;
 }
@@ -1367,6 +1532,8 @@ STDMETHODIMP IDirect3DDevice9GLES::CreateTexture(UINT Width, UINT Height, UINT L
     if (!ppTexture) return D3DERR_INVALIDCALL;
     static const bool s_log = std::getenv("NFSU2_DIAG_FRAMES") != nullptr;
     if (s_log) {
+        static std::mutex s_seenMutex;   // textures are also created on the game thread (bridge: async CreateTexture)
+        std::lock_guard<std::mutex> lock(s_seenMutex);
         static std::set<std::pair<DWORD, DWORD>> s_seen;
         if (s_seen.insert({static_cast<DWORD>(Format), Usage}).second) {
             std::printf("[D3D9 TEX] first CreateTexture fmt=0x%08X usage=0x%lX (%ux%u levels=%u pool=%u)\n",
@@ -1441,7 +1608,14 @@ void IDirect3DDevice9GLES::destroyBackBufferTarget() {
 void IDirect3DDevice9GLES::createBackBufferTarget(UINT width, UINT height) {
     destroyBackBufferTarget();
     int sw = 0, sh = 0;
+#ifdef __ANDROID__
+    if (g_hostWindow) {
+        sw = ANativeWindow_getWidth(reinterpret_cast<ANativeWindow*>(g_hostWindow));
+        sh = ANativeWindow_getHeight(reinterpret_cast<ANativeWindow*>(g_hostWindow));
+    }
+#else
     if (m_sdlWindow) SDL_GL_GetDrawableSize(m_sdlWindow, &sw, &sh);
+#endif
     m_screenW = sw > 0 ? sw : static_cast<int>(width);
     m_screenH = sh > 0 ? sh : static_cast<int>(height);
     const bool forced = std::getenv("NFSU2_FORCE_SCALER") != nullptr;
@@ -2413,7 +2587,7 @@ void IDirect3DDevice9GLES::applyTextures(const ShaderVariant* psVariant, bool ff
     glActiveTexture(GL_TEXTURE0);
 }
 
-bool IDirect3DDevice9GLES::prepareDraw(const void* upData, UINT upStride, INT baseVertex) {
+bool IDirect3DDevice9GLES::prepareDraw(const void* upData, UINT upStride, INT baseVertex, uint32_t instanceLayout, bool* instancingUnavailable) {
     if (m_fboDirty) bindRenderTarget();
     const std::vector<D3DVERTEXELEMENT9>& elems = currentElements();
 
@@ -2449,10 +2623,16 @@ bool IDirect3DDevice9GLES::prepareDraw(const void* upData, UINT upStride, INT ba
                 }
             }
         }
-        vsVar = m_boundVS->getVariant(bgraMask);
+        if (instanceLayout) {
+            vsVar = m_boundVS->getVariant(bgraMask | (instanceLayout << 16) | kInstancedVariantBit);
+            if (!vsVar || vsVar->attributes.size() >= static_cast<size_t>(m_maxAttribs)) { if (instancingUnavailable) *instancingUnavailable = true; return false; }
+        } else {
+            vsVar = m_boundVS->getVariant(bgraMask);
+        }
         if (!vsVar) return false;
         vsHandle = vsVar->glShader;
     } else {
+        if (instanceLayout) { if (instancingUnavailable) *instancingUnavailable = true; return false; }
         uint32_t key = hasPositionT ? kFFPVS_RHW : 0;
         for (int i = 0; i < elemCount; ++i) {
             const auto& e = elems[i];
@@ -2527,7 +2707,10 @@ bool IDirect3DDevice9GLES::prepareDraw(const void* upData, UINT upStride, INT ba
     }
 
     LinkedProgram* lp = m_pipelineManager.getProgram(vsHandle, psHandle, programmableVS ? vsVar : nullptr, psVar);
-    if (!lp) return false;
+    if (!lp || (instanceLayout && lp->instanceRegistersLoc == -1)) {
+        if (instanceLayout && instancingUnavailable) *instancingUnavailable = true;
+        return false;
+    }
     if (lp != m_currentProgram) {
         glUseProgram(lp->program);
         m_currentProgram = lp;
@@ -2826,6 +3009,76 @@ STDMETHODIMP IDirect3DDevice9GLES::DrawIndexedPrimitive(D3DPRIMITIVETYPE Primiti
     return D3D_OK;
 }
 
+// GLES 3 entry points for instancing (the Mali-G31 driver gives an ES 3.2 context; Mesa too), loaded on first use.
+void IDirect3DDevice9GLES::initInstancing() {
+    m_instancing.initialized = true;
+    static const bool off = std::getenv("NFSU2_INSTANCING") && std::getenv("NFSU2_INSTANCING")[0] == '0';
+    const char* version = reinterpret_cast<const char*>(glGetString(GL_VERSION));
+    if (off || !version || !std::strstr(version, "OpenGL ES 3")) {
+        std::printf("[D3D9 GLES] instanced world draws %s\n", off ? "off (NFSU2_INSTANCING=0)" : "unavailable (no OpenGL ES 3 context)");
+        return;
+    }
+#ifdef __ANDROID__
+    m_instancing.drawElementsInstanced = reinterpret_cast<void (*)(GLenum, GLsizei, GLenum, const void*, GLsizei)>(eglGetProcAddress("glDrawElementsInstanced"));
+    m_instancing.vertexAttribDivisor = reinterpret_cast<void (*)(GLuint, GLuint)>(eglGetProcAddress("glVertexAttribDivisor"));
+#else
+    m_instancing.drawElementsInstanced = reinterpret_cast<void (*)(GLenum, GLsizei, GLenum, const void*, GLsizei)>(SDL_GL_GetProcAddress("glDrawElementsInstanced"));
+    m_instancing.vertexAttribDivisor = reinterpret_cast<void (*)(GLuint, GLuint)>(SDL_GL_GetProcAddress("glVertexAttribDivisor"));
+#endif
+    if (!m_instancing.drawElementsInstanced || !m_instancing.vertexAttribDivisor) { std::printf("[D3D9 GLES] instanced world draws unavailable (entry points)\n"); return; }
+    { GLint vectors = 0; glGetIntegerv(GL_MAX_VERTEX_UNIFORM_VECTORS, &vectors);
+      if (const char* e = std::getenv("NFSU2_TEST_UNIFORM_VECTORS")) vectors = std::min<GLint>(vectors, std::atoi(e));   // test: a smaller GPU (draws split)
+      maxVertexUniformVectors() = vectors; }
+    float numbers[kMaxInstancesPerDraw];
+    for (int i = 0; i < kMaxInstancesPerDraw; ++i) numbers[i] = static_cast<float>(i);
+    glGenBuffers(1, &m_instancing.instanceNumbers);
+    glBindBuffer(GL_ARRAY_BUFFER, m_instancing.instanceNumbers);
+    glBufferData(GL_ARRAY_BUFFER, sizeof numbers, numbers, GL_STATIC_DRAW);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    m_instancing.available = true;
+    std::printf("[D3D9 GLES] instanced world draws on (%s; %d vertex uniform vectors: up to %d instances of 8 registers, %d of 12)\n", version,
+                maxVertexUniformVectors(), instancesPerDraw(8), instancesPerDraw(12));
+}
+
+bool IDirect3DDevice9GLES::drawIndexedInstanced(D3DPRIMITIVETYPE type, INT baseVertex, UINT minVertex, UINT numVertices, UINT startIndex, UINT primitives,
+                                               const uint16_t* registers, uint32_t count, uint32_t instances, const float* data) {
+    if (!m_instancing.initialized) initInstancing();
+    if (!m_instancing.available || !m_boundIB || !count || count > static_cast<uint32_t>(kMaxInstanceRegisters) || !instances ||
+        instances > static_cast<uint32_t>(kMaxInstancesPerDraw)) return false;
+    if (!primitives) return true;
+    const uint32_t perDraw = static_cast<uint32_t>(instancesPerDraw(static_cast<int>(count)));
+    if (perDraw < 2) return false;
+    const uint32_t layout = instanceLayoutId(registers, count);
+    if (layout > 0x7FFFu) return false;
+    traceDraw("DIPI", primitives);
+    bool unavailable = false;
+    if (!prepareDraw(nullptr, 0, baseVertex, layout, &unavailable)) return !unavailable;   // nothing to draw, as DrawIndexedPrimitive
+    LinkedProgram* lp = m_currentProgram;
+    const GLuint instanceNumberLocation = static_cast<GLuint>(lp->vs->attributes.size());
+    glBindBuffer(GL_ARRAY_BUFFER, m_instancing.instanceNumbers);
+    glEnableVertexAttribArray(instanceNumberLocation);
+    glVertexAttribPointer(instanceNumberLocation, 1, GL_FLOAT, GL_FALSE, 0, nullptr);
+    m_instancing.vertexAttribDivisor(instanceNumberLocation, 1);
+    const bool i16 = m_boundIB->getFormat() == D3DFMT_INDEX16;
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, m_boundIB->getIBO());
+    for (uint32_t done = 0; done < instances; done += perDraw) {   // as many per draw as the shader's nfs_inst array holds
+        const uint32_t n = std::min(perDraw, instances - done);
+        glUniform4fv(lp->instanceRegistersLoc, static_cast<GLsizei>(n * count), data + size_t(done) * count * 4);
+        DrawTimer timer;
+        m_instancing.drawElementsInstanced(convertPrimitiveType(type), primitiveCountToVertexCount(type, primitives), i16 ? GL_UNSIGNED_SHORT : GL_UNSIGNED_INT,
+                                           reinterpret_cast<const void*>(static_cast<uintptr_t>(startIndex * (i16 ? 2 : 4))), static_cast<GLsizei>(n));
+    }
+    m_instancing.vertexAttribDivisor(instanceNumberLocation, 0);
+    glDisableVertexAttribArray(instanceNumberLocation);
+    m_attribEnabled[instanceNumberLocation] = false;
+    checkGLError("drawIndexedInstanced", __LINE__);
+    // The register file as drawing them one by one would leave it.
+    for (uint32_t j = 0; j < count; ++j) m_pipelineManager.setVSConstantF(registers[j], data + (size_t(instances - 1) * count + j) * 4, 1);
+    ++m_instancing.draws; m_instancing.instances += instances;
+    (void)minVertex; (void)numVertices;
+    return true;
+}
+
 STDMETHODIMP IDirect3DDevice9GLES::DrawPrimitiveUP(D3DPRIMITIVETYPE PrimitiveType, UINT PrimitiveCount, const void* pVertexStreamZeroData, UINT VertexStreamZeroStride) {
     if (!pVertexStreamZeroData) return D3DERR_INVALIDCALL;
     if (!PrimitiveCount) return D3D_OK;
@@ -2864,4 +3117,17 @@ bool toggleD3D9FpsCounter() {
     d3d9_gles::g_fpsOverlay = on;
     std::printf("[NFSU2] Frame counter %s\n", on ? "on" : "off");
     return on;
+}
+
+// Bridge (d3d9_render_thread.inc): a DXT level decoded by a worker thread, uploaded without LockRect/UnlockRect.
+bool glesUploadDecodedLevel(IDirect3DTexture9* texture, uint32_t level, const uint8_t* rgba, const uint8_t* rgb565) {
+    if (!texture || texture->GetType() != D3DRTYPE_TEXTURE) return false;
+    return static_cast<d3d9_gles::IDirect3DTexture9GLES*>(texture)->uploadDecodedLevel(level, rgba, rgb565);
+}
+
+// Bridge (d3d9_render_thread.inc): one instanced draw for consecutive replayed world items with the same mesh.
+// dip: primitive type, base vertex, min vertex, vertex count, start index, primitive count.
+bool glesDrawIndexedInstanced(IDirect3DDevice9* device, const uint32_t* dip, const uint16_t* registers, uint32_t count, uint32_t instances, const float* data) {
+    return static_cast<d3d9_gles::IDirect3DDevice9GLES*>(device)->drawIndexedInstanced(static_cast<D3DPRIMITIVETYPE>(dip[0]), static_cast<INT>(dip[1]), dip[2], dip[3],
+                                                                                        dip[4], dip[5], registers, count, instances, data);
 }

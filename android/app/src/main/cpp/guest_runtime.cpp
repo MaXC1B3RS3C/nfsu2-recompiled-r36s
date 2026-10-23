@@ -11,6 +11,8 @@
 #include "nfs_widescreen.h"
 #endif
 #include <array>
+#include <utility>
+#include <unordered_map>
 #include <vector>
 #include <map>
 #include <memory>
@@ -143,6 +145,10 @@ std::atomic<uint64_t> statMachineLocks{0},statMachineWaits{0},statSyncWaits{0},s
 extern "C" void nfsWaitAdd(int kind,uint64_t ns);
 extern "C" bool nfsIsGameThread();
 extern "C" void nfsCsWait(uint32_t address,uint64_t ns);
+#if !defined(NFS_R36S)   // the R36S build has the real ones (src/runtime/fx_cache.c)
+extern "C" int nfs_fx_cap_depth = 0;
+extern "C" void nfs_fx_capture(uint32_t, const uint32_t*, uint32_t, int) {}
+#endif
 class MachineMutex {
     std::mutex m_;
     std::condition_variable cv_;
@@ -229,9 +235,18 @@ uint32_t read32(uint32_t va);
 // what it was waiting for, dumped when the game stops presenting frames.
 struct GuestThreadTrace {
     std::atomic<uint32_t> func{0},handle{0},esp{0};std::atomic<const char*> wait{nullptr};
-    std::array<std::atomic<uint32_t>,8> held{};  // critical sections this thread owns (outermost entries)
+    std::array<std::atomic<uint32_t>,16> held{};  // critical sections this thread owns (outermost entries)
     void hold(uint32_t cs){for(auto& slot:held){uint32_t empty=0;if(slot.compare_exchange_strong(empty,cs))return;}}
     void release(uint32_t cs){for(auto& slot:held){uint32_t value=cs;if(slot.compare_exchange_strong(value,0))return;}}
+    bool holdsLocks() const {
+        for(const auto& slot:held){if(slot.load(std::memory_order_acquire)!=0)return true;}
+        return false;
+    }
+    bool holds(uint32_t cs) const {
+        if(!cs)return false;
+        for(const auto& slot:held){if(slot.load(std::memory_order_acquire)==cs)return true;}
+        return false;
+    }
 };
 std::mutex threadTracesMutex;
 std::map<uint32_t,std::shared_ptr<GuestThreadTrace>> threadTraces;
@@ -282,6 +297,7 @@ void yieldGuestMachine(unsigned milliseconds=0,std::chrono::steady_clock::time_p
     if(!machineLease||!machineLease->owns_lock())throw GuestStop("Guest scheduler ownership missing");
     // Nothing queued for the machine: a plain yield would only cost an unlock, a syscall and a relock.
     if(!milliseconds&&!machine.hasWaiters())return;
+    if(!milliseconds&&currentTrace().holdsLocks())return;
     {auto& trace=currentTrace();trace.func=g_cur_func;trace.esp=g_esp;}
     State saved;saved.save();machineLease->unlock();
     if(deadline!=std::chrono::steady_clock::time_point{})std::this_thread::sleep_until(deadline);
@@ -296,10 +312,16 @@ void yieldGuestMachine(unsigned milliseconds=0,std::chrono::steady_clock::time_p
 std::mutex guestSyncMutex;
 std::condition_variable guestSyncCv;
 std::atomic<uint64_t> guestSyncGeneration{0};
+// Threads inside waitGuestSync, changed under guestSyncMutex like the generation: a notify that sees none skips the
+// futex wake (the game releases its mutexes and leaves critical sections ~100 times a frame, mostly unwatched); a
+// waiter that registers later sees the new generation before it sleeps.
+unsigned guestSyncWaiters=0;
+uint64_t statSyncNotifiesUnwatched=0;
 void notifyGuestSync(){
     ++statSyncNotifies;
-    {std::lock_guard<std::mutex> l(guestSyncMutex);guestSyncGeneration.fetch_add(1);}
-    guestSyncCv.notify_all();
+    bool watched;
+    {std::lock_guard<std::mutex> l(guestSyncMutex);guestSyncGeneration.fetch_add(1);watched=guestSyncWaiters!=0;if(!watched)++statSyncNotifiesUnwatched;}
+    if(watched)guestSyncCv.notify_all();
 }
 // ready (optional) is evaluated under guestSyncMutex without the machine: writers change the object
 // under the machine and then call notifyGuestSync (which takes guestSyncMutex), so the change is visible.
@@ -309,14 +331,18 @@ void waitGuestSync(uint64_t seen,unsigned maxMilliseconds,Ready ready){
     ++statSyncWaits;
     if(parallelGuest&&!machine.heldByMe()){
         std::unique_lock<std::mutex> l(guestSyncMutex);
+        ++guestSyncWaiters;
         guestSyncCv.wait_for(l,std::chrono::milliseconds(maxMilliseconds),[&]{return stopRequested.load()||(guestSyncGeneration.load()!=seen&&ready());});
+        --guestSyncWaiters;
         return;
     }
     if(!machineLease||!machineLease->owns_lock())throw GuestStop("Guest scheduler ownership missing");
     State saved;saved.save();machineLease->unlock();
     {
         std::unique_lock<std::mutex> l(guestSyncMutex);
+        ++guestSyncWaiters;
         guestSyncCv.wait_for(l,std::chrono::milliseconds(maxMilliseconds),[&]{return stopRequested.load()||(guestSyncGeneration.load()!=seen&&ready());});
+        --guestSyncWaiters;
     }
     machineLease->lock();saved.load();
 }
@@ -334,7 +360,12 @@ void checkGuestProgress() {
         auto now=std::chrono::steady_clock::now();
         if(bootDeadline!=std::chrono::steady_clock::time_point::max()&&now>bootDeadline)throw GuestStop("CRT bring-up time budget reached at "+hex(g_cur_func));
         // Time slicing only matters while threads take turns; parallel guest code holds no machine.
-        if(now>=nextYield&&(!parallelGuest||machine.heldByMe())){if(machine.hasWaiters())yieldGuestMachine();nextYield=std::chrono::steady_clock::now()+std::chrono::microseconds(500);}
+        if(now>=nextYield&&(!parallelGuest||machine.heldByMe())){
+            if(!currentTrace().holdsLocks()){
+                if(machine.hasWaiters())yieldGuestMachine();
+                nextYield=std::chrono::steady_clock::now()+std::chrono::microseconds(500);
+            }
+        }
     }
     if(!guestThreadFault.empty())throw GuestStop(guestThreadFault);
 }
@@ -476,9 +507,10 @@ void d3dDispatch(){uint32_t args[32];std::memcpy(args,ptr(g_esp+4,48),48);uint32
             for(size_t i=0;i<imports.size();++i){rows.push_back({imports[i].calls-lastCalls[i],i});lastCalls[i]=imports[i].calls;}
             std::sort(rows.rbegin(),rows.rend());
             static uint64_t l0=0,l1=0,l2=0,l3=0;
-            NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSU2","sync stats: machine locks %.1f/frame (%.1f waited), guest sync waits %.1f/frame, notifies %.1f/frame",
-                (statMachineLocks-l0)/600.0,(statMachineWaits-l1)/600.0,(statSyncWaits-l2)/600.0,(statSyncNotifies-l3)/600.0);
-            l0=statMachineLocks;l1=statMachineWaits;l2=statSyncWaits;l3=statSyncNotifies;
+            static uint64_t l4=0;
+            NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSU2","sync stats: machine locks %.1f/frame (%.1f waited), guest sync waits %.1f/frame, notifies %.1f/frame (%.1f with nobody waiting)",
+                (statMachineLocks-l0)/600.0,(statMachineWaits-l1)/600.0,(statSyncWaits-l2)/600.0,(statSyncNotifies-l3)/600.0,(statSyncNotifiesUnwatched-l4)/600.0);
+            l0=statMachineLocks;l1=statMachineWaits;l2=statSyncWaits;l3=statSyncNotifies;l4=statSyncNotifiesUnwatched;
             for(size_t i=0;i<rows.size()&&i<12&&rows[i].first;++i)
                 NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSU2","import stats: %s %.1f/frame%s",imports[rows[i].second].name.c_str(),rows[i].first/600.0,imports[rows[i].second].lockFree?" (lock-free)":"");
         }
@@ -763,8 +795,53 @@ void testGuestCriticalSections(){
     callGuest(leave,{data});okay=okay&&!criticalSections.count(data)&&!pendingCriticalDeletes.count(data)&&read32(data+8)==0;
     callGuest(initialize,{data});callGuest(remove,{data});okay=okay&&!criticalSections.count(data);
     heaps->free(GuestHeaps::process,data);
+
+    // Deadlock cycle resolution test: Thread 1 holds csA and requests csB; Worker 9001 holds csB and requests csA.
+    uint32_t csA=allocate(32),csB=allocate(32);
+    callGuest(initialize,{csA});callGuest(initialize,{csB});
+    callGuest(enter,{csA});
+    std::atomic<bool> workerHoldsB{false},workerDone{false};
+    std::thread deadlockWorker([&]{
+        std::unique_lock<MachineMutex> lease(machine);machineLease=&lease;guestThreadId=9001;
+        uint32_t workerStack=allocate(64*1024);
+        State fresh;fresh.esp=workerStack+64*1024-64;fresh.load();
+        callGuest(enter,{csB});
+        workerHoldsB=true;
+        notifyGuestSync();
+        callGuest(enter,{csA});
+        callGuest(leave,{csA});
+        callGuest(leave,{csB});
+        heaps->free(GuestHeaps::process,workerStack);
+        forgetThreadTrace();
+        workerDone=true;
+        notifyGuestSync();
+        machineLease=nullptr;
+    });
+    while(!workerHoldsB.load()){checkGuestProgress();waitGuestSync(guestSyncGeneration.load(),5);}
+    while(true){
+        {
+            std::lock_guard<std::mutex> lock(threadTracesMutex);
+            auto it=threadTraces.find(9001);
+            if(it!=threadTraces.end()&&it->second){
+                const char* w=it->second->wait.load();
+                if(w&&!std::strcmp(w,"EnterCriticalSection")&&it->second->handle.load()==csA)break;
+            }
+        }
+        checkGuestProgress();waitGuestSync(guestSyncGeneration.load(),5);
+    }
+    callGuest(enter,{csB});
+    bool deadlockPassed=read32(csA+12)==guestThreadId&&read32(csB+12)==guestThreadId;
+    callGuest(leave,{csB});
+    callGuest(leave,{csA});
+    machineLease->unlock();
+    deadlockWorker.join();
+    machineLease->lock();
+    callGuest(remove,{csA});callGuest(remove,{csB});
+    heaps->free(GuestHeaps::process,csA);heaps->free(GuestHeaps::process,csB);
+    okay=okay&&deadlockPassed&&workerDone.load();
+
     if(!okay)throw GuestStop("Guest critical-section retirement self-check failed");
-    NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSU2","Guest critical sections passed recursion, owner, guards, deferred retirement and reinitialization");
+    NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSU2","Guest critical sections passed recursion, owner, guards, deferred retirement, reinitialization and deadlock resolution");
 }
 thread_local uint32_t dynamicThunkAddress{};
 void generatedTestCallback(){++generatedTestCalls;ret(read32(arg(0)),0);}
@@ -1075,9 +1152,7 @@ void configureAndroidResolutionModes(){
 #if defined(NFS_R36S)
 // GetRacingResolution(int* w, int* h) is sub_005BF2E0 in the lifted SPEED2.EXE (stdcall, ret 8). It returns
 // fixed sizes per menu slot (640x480 for slot 0); the R36S build renames the lifted function *_orig
-// (build_guest_vm.sh wrap list) and answers with the size main.cpp chose for this screen. The 0x005BF610
-// entry check in arm64_guest.h is for another build of the exe: here that address is an unrelated
-// function, so nfs_android_resolution stays inert on the R36S.
+// (build_guest_vm.sh wrap list) and answers with the size main.cpp chose for this screen.
 extern "C" void sub_005BF2E0_orig(void);
 extern "C" void sub_005BF2E0(void){
     const uint32_t width=renderWidth.load(),height=renderHeight.load();
@@ -1096,8 +1171,12 @@ extern "C" int nfs_android_resolution(){
     if(firstGameResolution){write32(0x870d1c,5);firstGameResolution=false;}
     uint32_t index=read32(0x870d1c);if(index>=guestRenderModes.size())throw GuestStop("Invalid Android resolution index");
     width=guestRenderModes[index].width;height=guestRenderModes[index].height;
-    if(!memory->writable(arg(0),4)||!memory->writable(arg(1),4))throw GuestStop("Invalid guest resolution outputs");
-    write32(arg(0),width);write32(arg(1),height);ret(0,2);nfs_widescreen_set_resolution(width,height);
+    if(!memory->writable(arg(0),4)||!memory->writable(arg(1),4)){
+        NFS_RUNTIME_LOG(ANDROID_LOG_WARN,"NFSU2","nfs_android_resolution: non-writable outputs (arg0=0x%08x, arg1=0x%08x)",arg(0),arg(1));
+        return 0;
+    }
+    const uint32_t w=arg(0),h=arg(1);
+    write32(w,width);write32(h,height);ret(w,2);g_ecx=h;nfs_widescreen_set_resolution(width,height);
     NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSU2","Guest render resolution %ux%u slot=%u via original selector",width,height,index);
     return 1;
 #endif
@@ -1132,7 +1211,7 @@ std::string connectGuestRuntime(const char* executable) {
         loadImage(executable);
         if(guestWidescreen){
             nfs_widescreen_init(hostGameRoot.c_str());
-            NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSU2","Widescreen: %d HUD offsets from scripts/NFSUnderground2.WidescreenFix.dat",nfs_widescreen_hud_entries());
+            NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSU2","Widescreen: %d HUD offsets loaded",nfs_widescreen_hud_entries());
         }else NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSU2","Widescreen disabled: original 4:3 geometry");
 #if defined(NFS_R36S)
         // Slot 0 of the game's resolution table (originally 640x480) carries the size the host chose for
@@ -1165,9 +1244,9 @@ std::string connectGuestRuntime(const char* executable) {
 #if !defined(NFS_R36S)
         if(renderWidth.load()&&renderHeight.load()){
             uint32_t outputs=allocate(12);write32(outputs+8,0xdeadbeef);
-            callGuest(0x005bf610,{outputs,outputs+4});
+            callGuest(0x005bf2e0,{outputs,outputs+4});
             if(read32(outputs)!=renderWidth.load()||read32(outputs+4)!=renderHeight.load()||read32(outputs+8)!=0xdeadbeef)throw GuestStop("Guest resolution ABI failed");
-            for(uint32_t i=0;i<6;++i){write32(0x870d1c,i);callGuest(0x005bf610,{outputs,outputs+4});
+            for(uint32_t i=0;i<6;++i){write32(0x870d1c,i);callGuest(0x005bf2e0,{outputs,outputs+4});
                 if(read32(outputs)!=guestRenderModes[i].width||read32(outputs+4)!=guestRenderModes[i].height||read32(outputs+8)!=0xdeadbeef)throw GuestStop("Guest resolution slot/guard check failed");}
             write32(0x870d1c,5);firstGameResolution=true;
             heaps->free(GuestHeaps::process,outputs);
@@ -1225,6 +1304,31 @@ std::string connectGuestRuntime(const char* executable) {
     }
 }
 void requestGuestRuntimeStop() {stopRequested=true;}
+// Quitting (Select+Start, the window closing): wait until the game has no file open for writing (a save or
+// profile being written), at most timeoutMs, then fsync whatever is open and sync the whole card. The guest
+// is held at a runtime call while the handles are inspected (machine lock), so no write is half done; ending
+// the process in the middle of a save, without a flush, is what left saves and card filesystems damaged.
+void quiesceGuestFilesForExit(int timeoutMs){
+    const auto deadline=std::chrono::steady_clock::now()+std::chrono::milliseconds(timeoutMs);
+    int writable=-1;
+    for(;;){
+        {
+            std::unique_lock<MachineMutex> lock(machine);
+            writable=0;
+            for(auto& entry:fileHandles){
+                const int fl=::fcntl(entry.second,F_GETFL);
+                if(fl>=0&&(fl&O_ACCMODE)!=O_RDONLY)++writable;
+            }
+            if(!writable||std::chrono::steady_clock::now()>=deadline){
+                for(auto& entry:fileHandles)::fsync(entry.second);
+                break;
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    ::sync();
+    NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSU2","Exit: files flushed (%d still open for writing), card synced",writable);
+}
 void setGuestPaused(bool paused) {guestPaused=paused;}
 bool guestDrivingControls() {return inputDrivingMode.load();}
 extern "C" int nfsGuestDriving(){return inputDrivingMode.load()?1:0;}
@@ -1293,8 +1397,19 @@ extern "C" bool nfsParallelGuest(){return parallelGuest;}
 // effect, so call sites can cache it (arm64_guest.h NFS_ICALL_RESOLVE).
 // Indirect calls to D3D9 COM methods land here (cached per call site). Queued/filtered calls (~28k per race
 // frame) return without going through d3dDispatch; everything else (Present, synchronous calls) does.
+extern "C" uint32_t getD3D9PresentCount();
 static void d3dDispatchFromCallVa(){
     const uint32_t token=nfs_icall_va;
+    // NFSU2_D3D_GENERIC_STATS=1: which methods still take this generic path (logged every 600 frames)
+    static const bool genericStats=std::getenv("NFSU2_D3D_GENERIC_STATS")!=nullptr;
+    if(__builtin_expect(genericStats,0)){
+        static std::unordered_map<uint32_t,uint64_t> counts;static uint32_t lastReport=0;++counts[token];
+        const uint32_t frame=getD3D9PresentCount();
+        if(frame>=lastReport+600){lastReport=frame;std::vector<std::pair<uint64_t,uint32_t>> rows;for(auto& c:counts)rows.push_back({c.second,c.first});
+            std::sort(rows.rbegin(),rows.rend());std::string line;
+            for(size_t i=0;i<rows.size()&&i<12;++i)line+=" k"+std::to_string((rows[i].second-0x7e000000u)/4096)+"/m"+std::to_string(((rows[i].second-0x7e000000u)%4096)/16)+"="+std::to_string(rows[i].first/600);
+            NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSU2","[D3D9 generic] calls per frame:%s",line.c_str());counts.clear();}
+    }
     if(parallelGuest&&token!=0x7e002110u){
         uint32_t args[12];std::memcpy(args,ptr(g_esp+4,48),48);uint32_t count=0,result;
         if(dispatchGuestD3D9TryDefer(token,args,&count,&result)){
@@ -1307,8 +1422,53 @@ extern "C" int nfsD3dReplay(uint32_t token,const uint32_t* args){
     uint32_t a[12]={};std::memcpy(a,args,9*4);uint32_t count=0,result=0;
     return dispatchGuestD3D9TryDefer(token,a,&count,&result)?1:0;
 }
+#if defined(NFS_R36S)
+// Device method calls from the lifted code, one handler per method (D3D9 device methods 0..118): the arguments stay on
+// the guest stack and go straight to the bridge's shortcut (d3d9_render_thread.inc); anything it does not take, and
+// calls made while the effect memo captures (nfs_fx_cap_depth), take the generic path.
+extern "C" int nfsD3dShortcutsEnabled();
+extern "C" int nfsD3dDeviceCallShortcut(uint32_t method,const uint32_t* args,uint32_t* count);
+template<uint32_t Method>void d3dDeviceCallShortcut(){
+    uint32_t count=0;const auto args=static_cast<const uint32_t*>(ptr(g_esp+4,36));
+    if(nfsD3dDeviceCallShortcut(Method,args,&count)){
+        if(__builtin_expect(nfs_fx_cap_depth!=0,0))nfs_fx_capture(nfs_icall_va,args,count,1);   // as the generic path
+        qpcStreak=0;g_eax=0;g_esp+=4+count*4;return;}
+    d3dDispatchFromCallVa();
+}
+template<std::size_t... Method>constexpr std::array<recomp_func_t,sizeof...(Method)> deviceShortcutTable(std::index_sequence<Method...>){
+    return {{&d3dDeviceCallShortcut<uint32_t(Method)>...}};
+}
+// AddRef (1) / Release (2) of textures, cube textures, vertex and index buffers (kinds 3, 4, 6, 7).
+extern "C" int nfsD3dReferenceShortcut(uint32_t kind,uint32_t method,const uint32_t* args,uint32_t* result);
+template<uint32_t Kind,uint32_t Method>void d3dReferenceShortcut(){
+    uint32_t result=0;const auto args=static_cast<const uint32_t*>(ptr(g_esp+4,36));
+    if(nfsD3dReferenceShortcut(Kind,Method,args,&result)){
+        if(__builtin_expect(nfs_fx_cap_depth!=0,0))nfs_fx_capture(nfs_icall_va,args,1,1);   // as the generic path
+        qpcStreak=0;g_eax=result;g_esp+=8;return;}
+    d3dDispatchFromCallVa();
+}
+recomp_func_t referenceShortcut(uint32_t kind,uint32_t method){
+    switch(kind*4+method){
+    case 3*4+1:return d3dReferenceShortcut<3,1>;case 3*4+2:return d3dReferenceShortcut<3,2>;
+    case 4*4+1:return d3dReferenceShortcut<4,1>;case 4*4+2:return d3dReferenceShortcut<4,2>;
+    case 6*4+1:return d3dReferenceShortcut<6,1>;case 6*4+2:return d3dReferenceShortcut<6,2>;
+    case 7*4+1:return d3dReferenceShortcut<7,1>;case 7*4+2:return d3dReferenceShortcut<7,2>;
+    default:return nullptr;
+    }
+}
+constexpr uint32_t deviceMethodCount=119;
+const std::array<recomp_func_t,deviceMethodCount> deviceCallShortcuts=deviceShortcutTable(std::make_index_sequence<deviceMethodCount>());
+#endif
 extern "C" recomp_func_t recomp_lookup_cacheable(uint32_t va){
-    if(va>=0x7e001000u&&va<0x7e010000u&&!(va%16)){checkGuestProgress();return d3dDispatchFromCallVa;}
+    if(va>=0x7e001000u&&va<0x7e010000u&&!(va%16)){
+        checkGuestProgress();
+#if defined(NFS_R36S)
+        const uint32_t kind=(va-0x7e000000u)/4096,method=((va-0x7e000000u)%4096)/16;
+        if(kind==2&&method<deviceMethodCount&&nfsD3dShortcutsEnabled())return deviceCallShortcuts[method];
+        if((method==1||method==2)&&nfsD3dShortcutsEnabled())if(recomp_func_t shortcut=referenceShortcut(kind,method))return shortcut;
+#endif
+        return d3dDispatchFromCallVa;
+    }
     return nullptr;
 }
 #else

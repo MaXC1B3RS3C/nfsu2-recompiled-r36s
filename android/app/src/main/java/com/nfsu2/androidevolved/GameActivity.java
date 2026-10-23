@@ -37,6 +37,7 @@ public final class GameActivity extends NativeActivity {
     private Runnable statusHideTask;
     private static native void nativeKey(int scan, boolean down);
     private static native boolean nativeDrivingControls();
+    private static native void nativeRenderer(String renderer);
     private final boolean[] touchKeys=new boolean[256],sentKeys=new boolean[256];
     private boolean tiltLeft,tiltRight,tiltEnabled,tiltCalibrate=true;
     private float tiltFiltered,tiltNeutral,tiltSensitivity=1;
@@ -193,6 +194,8 @@ public final class GameActivity extends NativeActivity {
         DisplayMetrics metrics = new DisplayMetrics(); getWindowManager().getDefaultDisplay().getRealMetrics(metrics);
         int[] size = GameOptions.renderSize(this, Math.max(metrics.widthPixels, metrics.heightPixels),
                 Math.min(metrics.widthPixels, metrics.heightPixels));
+        String renderer = launch.getStringExtra("renderer");
+        nativeRenderer(renderer != null ? renderer : GameOptions.get(this, GameOptions.RENDERER));
         nativeResolution(launch.getIntExtra("renderWidth", size[0]), launch.getIntExtra("renderHeight", size[1]));
         String language = launch.getStringExtra("language");
         nativeLanguage(language != null ? language : GameOptions.language(this));

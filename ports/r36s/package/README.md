@@ -18,7 +18,7 @@ Copy the files to your SD card (either `TF1` or `TF2/EASYROMS`) under the `ports
     ├── libs/                       <- Bundled runtime libraries (libSDL2, etc.)
     ├── widescreen/                 <- HUD layout for wide screens (ThirteenAG's widescreen fix, MIT)
     └── gamedata/                   <- YOUR PC GAME FILES GO HERE
-        ├── SPEED2.EXE              <- Unpacked PC executable
+        ├── SPEED2.EXE              <- European v1.2 No-CD executable (exactly 4,788,224 bytes)
         ├── GLOBAL/                 <- Global assets (GLOBALB.BUN, etc.)
         ├── CARS/                   <- Car models, textures, vinyls
         ├── TRACKS/                 <- City tracks and collision data
@@ -30,6 +30,13 @@ Copy the files to your SD card (either `TF1` or `TF2/EASYROMS`) under the `ports
 
 > [!IMPORTANT]
 > **No copyrighted game assets are bundled.** You must provide your own legitimate retail PC copy of Need for Speed: Underground 2.
+>
+> **Required Executable**:
+> * Must be **v1.2 European / Multi-Language No-CD**
+> * Exact File Size: **`4,788,224 bytes`** (~4.57 MB)
+> * MD5: `95b4dc3e9a6c72b06a8bd62b0c56ea63`
+> * SHA-256: `04b83e2d13c91c6ec294b578a08240ebcfff6fa9513df584edaa968e4ab9990c`
+> * *Note: Do not use the US v1.2 binary (4,800,512 bytes) or v1.0/v1.1, as static code offsets differ.*
 
 ---
 
@@ -81,6 +88,12 @@ Button names are the labels printed on the R36S. The layout follows the PS2 vers
   tinting and detailed car models on top of the chosen profile. They add no draw calls and no CPU work; whether
   the GPU has room for them is what the `[NFSU2 GPU]` lines in `log.txt` show. `NFSU2_GPU_EXTRAS=ab` alternates
   off/on at each launch for a comparison (`log.prev.txt` keeps the previous session).
+- **Speed-ups you can switch off** (in `nfsu2.cfg`, only for troubleshooting): `NFSU2_ASYNC_TEXTURES=0`
+  (textures created without stopping the game, since v33), `NFSU2_GROUP_CACHE=0` (replay of learned world draws),
+  `NFSU2_RENDER_THREAD=0` (separate render thread), `NFSU2_INSTANCING=0` (repeated world objects such as lamp
+  posts and barriers drawn with one instanced draw, since v34), `NFSU2_NATIVE_SCENE=0` (native scene culling and
+  render-item code instead of the translated originals, since v35). `NFSU2_GPU_PROBE=0` turns off the GPU timing sample that
+  `log.txt` reports as `[NFSU2 GPU] probe`.
 - **Target FPS**: 30–60 FPS with CPU performance governor enabled in `NFSU2.sh`.
 - **Audio Engine**: SDL2 PCM stereo float mixer with low latency.
 - **Memory**: Runs comfortably within the 1 GB DDR3L RAM boundary of RK3326.
@@ -90,6 +103,11 @@ Button names are the labels printed on the R36S. The layout follows the PS2 vers
 
 ## 🛠️ Troubleshooting
 
+- **Older ArkOS (2.0) or another image with an old glibc**: since v36 the binary needs only glibc 2.18 or newer (the
+  C++ runtime is built in). If it still does not start, `log.txt` or the terminal shows the missing library or
+  version; send that line. `log.txt` also reports `glibc compat: newer libm functions` (the running glibc has the
+  faster math functions) or `glibc compat: GLIBC_2.17 libm functions` (older glibc; same results, slightly slower
+  `log`/`pow`). `NFSU2_GLIBC_COMPAT_OLD=1` forces the second case for testing.
 - **Black screen on launch**: Verify that `SPEED2.EXE` is present inside `gamedata/`. Check `ports/nfsu2/log.txt` for details.
 - **Controls not responding**: Ensure `gamecontrollerdb.txt` exists in PortMaster, or verify controller configuration in EmulationStation.
 - **Audio stutter**: Ensure CPU governor is set to `performance` in the launch script.

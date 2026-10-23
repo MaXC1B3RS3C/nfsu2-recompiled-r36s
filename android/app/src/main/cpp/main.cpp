@@ -1,6 +1,7 @@
 #include <android_native_app_glue.h>
 #include <android/log.h>
 #include <vulkan/vulkan.h>
+#include "vulkan_driver.h"
 #include <algorithm>
 #include <vector>
 #include <stdexcept>
@@ -315,6 +316,11 @@ extern "C" JNIEXPORT void JNICALL Java_com_nfsu2_androidevolved_GameActivity_nat
 extern "C" JNIEXPORT void JNICALL Java_com_nfsu2_androidevolved_GameActivity_nativeCpuTextures(JNIEnv*,jclass,jboolean enabled){
     compatCpuTextures=enabled==JNI_TRUE;setD3D9Compatibility(compatCpuTextures,compatBackBuffers);
 }
+extern "C" JNIEXPORT void JNICALL Java_com_nfsu2_androidevolved_GameActivity_nativeRenderer(JNIEnv* env,jclass,jstring rendererStr){
+    if(!rendererStr)return;
+    const char* str=env->GetStringUTFChars(rendererStr,nullptr);
+    if(str){setD3D9Renderer(str);env->ReleaseStringUTFChars(rendererStr,str);}
+}
 // A driver imported in the launcher replaces the system one for DXVK. The bootstrap
 // renderer, which links the system loader, is then skipped so one process never
 // drives the GPU through two Vulkan drivers.
@@ -322,6 +328,7 @@ static bool customVulkanDriver=false;
 static std::string customVulkanError;
 extern "C" void dxvkAndroidSetInstanceProcAddr(PFN_vkGetInstanceProcAddr entry);
 extern "C" JNIEXPORT void JNICALL Java_com_nfsu2_androidevolved_GameActivity_nativeGpuDriver(JNIEnv* env,jclass,jstring hooks,jstring temp,jstring directory,jstring library){
+    if(isD3D9Gles())return;
     auto text=[&](jstring value){const char* c=value?env->GetStringUTFChars(value,nullptr):nullptr;std::string r=c?c:"";if(c)env->ReleaseStringUTFChars(value,c);return r;};
     std::string h=text(hooks),t=text(temp),d=text(directory),l=text(library);
     if(l.empty())return;
@@ -367,28 +374,49 @@ void android_main(android_app* app) {
         if (!host.resumed || !app->window || host.failed) continue;
         try {
             setD3D9HostWindow(app->window);
-            if(d3d9RequestsSurface()){host.renderer.stop();acknowledgeD3D9Surface(true);}
-            setGuestPaused(false);
-            if(!customVulkanError.empty())throw std::runtime_error(customVulkanError);
-            if (!host.renderer.device&&!d3d9RequestsSurface()&&!(customVulkanDriver&&host.guestAttempted)) {
-                checkGameData();
-                if(customVulkanDriver){
-                    setGuestDisplaySize(unsigned(ANativeWindow_getWidth(app->window)),unsigned(ANativeWindow_getHeight(app->window)));
-                }else{
-                    host.renderer.start(app->window);
-                    setGuestDisplaySize(host.renderer.extent.width,host.renderer.extent.height);
-                }
+            if(isD3D9Gles()){
+                setGuestPaused(false);
                 if (!host.guestAttempted) {
+                    checkGameData();
+                    setGuestDisplaySize(unsigned(ANativeWindow_getWidth(app->window)), unsigned(ANativeWindow_getHeight(app->window)));
                     host.guestAttempted = true;
-                    host.guestWorker.start(std::string(kGameRoot) + "/SPEED2.EXE");
+                    std::string exePath = std::string(kGameRoot) + "/SPEED2.EXE";
+                    struct stat st{};
+                    if (stat(exePath.c_str(), &st) != 0) exePath = std::string(kGameRoot) + "/speed2.exe";
+                    host.guestWorker.start(exePath);
                 }
+                auto status = host.guestWorker.status();
+                if (status != host.guestStatus) {
+                    host.guestStatus = status;
+                    showStatus(app, ("Datos accesibles: memoria interna/nfsu2\nOpenGL ES: presentación activa\n" + status).c_str());
+                }
+            }else{
+                if(d3d9RequestsSurface()){host.renderer.stop();acknowledgeD3D9Surface(true);}
+                setGuestPaused(false);
+                if(!customVulkanError.empty())throw std::runtime_error(customVulkanError);
+                if (!host.renderer.device&&!d3d9RequestsSurface()&&!(customVulkanDriver&&host.guestAttempted)) {
+                    checkGameData();
+                    if(customVulkanDriver){
+                        setGuestDisplaySize(unsigned(ANativeWindow_getWidth(app->window)),unsigned(ANativeWindow_getHeight(app->window)));
+                    }else{
+                        host.renderer.start(app->window);
+                        setGuestDisplaySize(host.renderer.extent.width,host.renderer.extent.height);
+                    }
+                    if (!host.guestAttempted) {
+                        host.guestAttempted = true;
+                        std::string exePath = std::string(kGameRoot) + "/SPEED2.EXE";
+                        struct stat st{};
+                        if (stat(exePath.c_str(), &st) != 0) exePath = std::string(kGameRoot) + "/speed2.exe";
+                        host.guestWorker.start(exePath);
+                    }
+                }
+                auto status=host.guestWorker.status();
+                if(status!=host.guestStatus){
+                    host.guestStatus=status;
+                    showStatus(app,("Datos accesibles: memoria interna/nfsu2\nVulkan 1.1: presentación activa\n"+status).c_str());
+                }
+                if (host.renderer.device&&!host.renderer.draw()) host.renderer.stop();
             }
-            auto status=host.guestWorker.status();
-            if(status!=host.guestStatus){
-                host.guestStatus=status;
-                showStatus(app,("Datos accesibles: memoria interna/nfsu2\nVulkan 1.1: presentación activa\n"+status).c_str());
-            }
-            if (host.renderer.device&&!host.renderer.draw()) host.renderer.stop();
         } catch (const std::exception& e) {
             __android_log_print(ANDROID_LOG_ERROR, "NFSU2", "%s", e.what());
             showStatus(app, e.what());

@@ -186,7 +186,7 @@ public final class LauncherActivity extends Activity {
         boolean allowed = allowed();
         File root = gameRoot();
         checksList.removeAllViews();
-        boolean exe = allowed && new File(root, "SPEED2.EXE").isFile();
+        boolean exe = allowed && (new File(root, "SPEED2.EXE").isFile() || new File(root, "speed2.exe").isFile());
         addCheck("SPEED2.EXE", exe, true);
         StringBuilder missing = new StringBuilder();
         for (String folder : new String[] {"GLOBAL", "TRACKS", "CARS", "FRONTEND", "LANGUAGES"})
@@ -205,15 +205,18 @@ public final class LauncherActivity extends Activity {
 
     private void refreshOptions() {
         optionsList.removeAllViews();
-        GpuDrivers.Driver driver = GpuDrivers.selected(this);
-        // Custom drivers (libadrenotools) exist only in the 64-bit build.
-        if (android.os.Process.is64Bit())
-            optionsList.addView(optionRow("Driver Vulkan", driver == null ? "Del sistema" : driver.name, this::chooseDriver));
-        optionsList.addView(optionRow("Probar driver", "GPU y funciones Vulkan", () -> probeDriver(false)));
-        optionsList.addView(optionRow("Idioma", languageLabel(), this::chooseLanguage));
-        optionsList.addView(optionRow("Reiniciar caché gráfica", "Regenerar shaders", () -> GraphicsCache.prompt(this)));
         for (GameOptions.Option option : GameOptions.ALL)
             optionsList.addView(optionRow(option.title, option.label(GameOptions.get(this, option.key)), () -> chooseOption(option)));
+        boolean isVulkan = GameOptions.get(this, GameOptions.RENDERER).equals("vulkan");
+        if (isVulkan) {
+            GpuDrivers.Driver driver = GpuDrivers.selected(this);
+            // Custom drivers (libadrenotools) exist only in the 64-bit build.
+            if (android.os.Process.is64Bit())
+                optionsList.addView(optionRow("Driver Vulkan", driver == null ? "Del sistema" : driver.name, this::chooseDriver));
+            optionsList.addView(optionRow("Probar driver", "GPU y funciones Vulkan", () -> probeDriver(false)));
+            optionsList.addView(optionRow("Reiniciar caché gráfica", "Regenerar shaders", () -> GraphicsCache.prompt(this)));
+        }
+        optionsList.addView(optionRow("Idioma", languageLabel(), this::chooseLanguage));
         optionsList.addView(optionRow("Servidor online", GameOptions.onlineServer(this), this::chooseOnlineServer));
         optionsList.addView(optionRow("Buscar actualizaciones",
                 checkingUpdates ? "Comprobando GitHub…" : "Versión " + ReleaseUpdates.installed(this), () -> checkUpdates(true)));
@@ -429,7 +432,8 @@ public final class LauncherActivity extends Activity {
     // ---- Launch ----------------------------------------------------------------------------------------
 
     private void play() {
-        if (android.os.Process.is64Bit() && GpuDrivers.selected(this) != null) probeDriver(true);
+        boolean isVulkan = GameOptions.get(this, GameOptions.RENDERER).equals("vulkan");
+        if (isVulkan && android.os.Process.is64Bit() && GpuDrivers.selected(this) != null) probeDriver(true);
         else launch();
     }
 
@@ -446,6 +450,7 @@ public final class LauncherActivity extends Activity {
                 Math.min(metrics.widthPixels, metrics.heightPixels));
         String[] loader = GpuDrivers.loaderArguments(this);
         startActivity(new Intent(this, GameActivity.class)
+                .putExtra("renderer", GameOptions.get(this, GameOptions.RENDERER))
                 .putExtra("language", GameOptions.language(this))
                 .putExtra("renderWidth", size[0]).putExtra("renderHeight", size[1])
                 .putExtra("frameCap", Integer.parseInt(GameOptions.get(this, GameOptions.FPS)))

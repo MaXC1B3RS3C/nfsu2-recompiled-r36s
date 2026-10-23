@@ -158,10 +158,16 @@ Current state as of **October 2026**:
 
 | Property | Details |
 |---|---|
-| **Binary File** | `SPEED2.EXE` (4,800,512 bytes) |
-| **SHA-256 Checksum** | `f9dd86c054878ce6276beb07c1fd61874f7a1e4bf1f241b084c65b73e24168a7` |
+| **Required Binary** | `SPEED2.EXE` (European / Multi-Language v1.2 No-CD) |
+| **Exact File Size** | `4,788,224` bytes (~4.57 MB) |
+| **SHA-256 Checksum** | `04b83e2d13c91c6ec294b578a08240ebcfff6fa9513df584edaa968e4ab9990c` |
+| **MD5 Checksum** | `95b4dc3e9a6c72b06a8bd62b0c56ea63` |
+| **PE Entry Point** | `0x0075B9F1` (RVA `0x35B9F1`) |
 | **Embedded Date** | `Feb 9 2005` (online `VERS` field) |
 | **Binary Format** | Unpacked image (`.text` clean code, rebuilt imports, relocations preserved) |
+
+> [!IMPORTANT]
+> Because this is a native static recompilation, the lifted ARM64/x86 code is compiled against the exact memory offsets of this European v1.2 executable. Do not use the US v1.2 executable (4,800,512 bytes) or unpatched v1.0/v1.1 binaries, as internal memory layouts differ.
 
 *For deep binary details, see [docs/NFSU2_BINARY_REPORT.md](docs/NFSU2_BINARY_REPORT.md).*
 

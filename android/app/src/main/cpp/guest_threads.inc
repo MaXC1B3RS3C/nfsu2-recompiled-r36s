@@ -180,7 +180,7 @@ void waitThread(){
 }
 // WaitForSingleObject for free-running threads (no machine held): mutexes directly, anything else (events,
 // threads) under the machine as before.
-void waitSingleFree(){
+[[maybe_unused]] void waitSingleFree(){
     if(auto mutex=findGuestMutex(arg(0))){ret(acquireGuestMutex(mutex,arg(1)),2);return;}
     machine.lock();
     try{waitThread();}catch(...){machine.unlock();throw;}

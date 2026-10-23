@@ -1,7 +1,23 @@
 # SPEED2.EXE binary report
 
+## Target Recompiled Binary (European / Multi-Language v1.2)
+This is the binary from which all 27,758 functions in `src/recomp/gen/` (`catalog.json`) are generated and compiled:
+
 | Field | Value |
 |---|---|
+| Variant | European / Multi-Language v1.2 No-CD |
+| Size | **4,788,224 bytes** (~4.57 MB) |
+| SHA-256 | `04b83e2d13c91c6ec294b578a08240ebcfff6fa9513df584edaa968e4ab9990c` |
+| MD5 | `95b4dc3e9a6c72b06a8bd62b0c56ea63` |
+| Analysis SHA-256 | `22aab4e461f15d2ad4df7c98ebb6b307976c3c7bba6d5c43b1510eb9c59fef8b` (`SPEED2.analysis.exe`) |
+| Entry point | **0x0075B9F1** (RVA `0x35B9F1`) |
+
+## Upstream Exploratory Binary (US v1.2)
+This binary was referenced in early upstream documentation before code lifting:
+
+| Field | Value |
+|---|---|
+| Variant | US v1.2 No-CD |
 | Path (local) | `Need for Speed Underground 2/SPEED2.EXE` |
 | Size | 4,800,512 bytes |
 | SHA-256 | `f9dd86c054878ce6276beb07c1fd61874f7a1e4bf1f241b084c65b73e24168a7` |

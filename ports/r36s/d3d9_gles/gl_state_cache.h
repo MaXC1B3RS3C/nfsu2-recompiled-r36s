@@ -11,7 +11,12 @@
 // outside the layer that touches GL must call glsc::invalidate() afterwards.
 //
 // Only one GL context and one thread (the game thread) use these, so the cache is plain globals.
+#ifdef __ANDROID__
+#include <GLES2/gl2.h>
+#include <GLES2/gl2ext.h>
+#else
 #include <SDL2/SDL_opengles2.h>
+#endif
 #include <cstdint>
 #include <cstring>
 #include <ctime>
