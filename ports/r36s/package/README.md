@@ -92,7 +92,9 @@ Button names are the labels printed on the R36S. The layout follows the PS2 vers
   (textures created without stopping the game, since v33), `NFSU2_GROUP_CACHE=0` (replay of learned world draws),
   `NFSU2_RENDER_THREAD=0` (separate render thread), `NFSU2_INSTANCING=0` (repeated world objects such as lamp
   posts and barriers drawn with one instanced draw, since v34), `NFSU2_NATIVE_SCENE=0` (native scene culling and
-  render-item code instead of the translated originals, since v35). `NFSU2_GPU_PROBE=0` turns off the GPU timing sample that
+  render-item code instead of the translated originals, since v35), `NFSU2_PRESENT_THREAD=0` (a separate thread shows
+  the finished frame, so the CPU can start the next frame while the GPU still draws the last one, since v37;
+  `NFSU2_PRESENT_SLOTS=3` allows one more frame in flight). `NFSU2_GPU_PROBE=0` turns off the GPU timing sample that
   `log.txt` reports as `[NFSU2 GPU] probe`.
 - **Target FPS**: 30–60 FPS with CPU performance governor enabled in `NFSU2.sh`.
 - **Audio Engine**: SDL2 PCM stereo float mixer with low latency.

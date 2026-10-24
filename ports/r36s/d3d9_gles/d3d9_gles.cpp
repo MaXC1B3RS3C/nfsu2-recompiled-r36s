@@ -16,7 +16,12 @@ extern "C" bool nfsParallelGuest();  // guest_runtime.cpp: guest threads run in 
 #include <cmath>
 #include <csignal>
 #include <chrono>
+#include <atomic>
+#include <condition_variable>
+#include <cstring>
+#include <deque>
 #include <dirent.h>
+#include <dlfcn.h>
 #if !defined(__ANDROID__)
 #include <execinfo.h>
 #endif
@@ -793,6 +798,461 @@ STDMETHODIMP IDirect3D9GLES::CreateDevice(UINT Adapter, D3DDEVTYPE DeviceType, H
 // IDirect3DDevice9GLES: construction, defaults
 // =============================================================================
 
+// =============================================================================
+// Screen scaler blit, and the presenter thread
+// =============================================================================
+// Scales the back-buffer texture onto the window (letterboxed; a rotated panel swaps width and height) and, in
+// smoke tests, saves what the panel shows. Runs on the render thread, or on the presenter thread.
+// scaleBlit talks to the driver directly: the glsc:: state cache (gl_state_cache.h) is one global shadow for
+// the render thread's context, and the presenter thread (another context) must neither read nor update it.
+// The render-thread caller invalidates the cache afterwards.
+#pragma push_macro("glEnable")
+#undef glEnable
+#pragma push_macro("glDisable")
+#undef glDisable
+#pragma push_macro("glBlendFunc")
+#undef glBlendFunc
+#pragma push_macro("glBlendFuncSeparate")
+#undef glBlendFuncSeparate
+#pragma push_macro("glBlendEquation")
+#undef glBlendEquation
+#pragma push_macro("glBlendEquationSeparate")
+#undef glBlendEquationSeparate
+#pragma push_macro("glBlendColor")
+#undef glBlendColor
+#pragma push_macro("glDepthFunc")
+#undef glDepthFunc
+#pragma push_macro("glDepthMask")
+#undef glDepthMask
+#pragma push_macro("glDepthRangef")
+#undef glDepthRangef
+#pragma push_macro("glColorMask")
+#undef glColorMask
+#pragma push_macro("glCullFace")
+#undef glCullFace
+#pragma push_macro("glFrontFace")
+#undef glFrontFace
+#pragma push_macro("glPolygonOffset")
+#undef glPolygonOffset
+#pragma push_macro("glViewport")
+#undef glViewport
+#pragma push_macro("glScissor")
+#undef glScissor
+#pragma push_macro("glStencilFuncSeparate")
+#undef glStencilFuncSeparate
+#pragma push_macro("glStencilOpSeparate")
+#undef glStencilOpSeparate
+#pragma push_macro("glStencilMask")
+#undef glStencilMask
+#pragma push_macro("glClearColor")
+#undef glClearColor
+#pragma push_macro("glClearDepthf")
+#undef glClearDepthf
+#pragma push_macro("glClearStencil")
+#undef glClearStencil
+#pragma push_macro("glActiveTexture")
+#undef glActiveTexture
+#pragma push_macro("glBindTexture")
+#undef glBindTexture
+#pragma push_macro("glDeleteTextures")
+#undef glDeleteTextures
+#pragma push_macro("glBindBuffer")
+#undef glBindBuffer
+#pragma push_macro("glDeleteBuffers")
+#undef glDeleteBuffers
+#pragma push_macro("glBindFramebuffer")
+#undef glBindFramebuffer
+#pragma push_macro("glDeleteFramebuffers")
+#undef glDeleteFramebuffers
+#pragma push_macro("glBindRenderbuffer")
+#undef glBindRenderbuffer
+#pragma push_macro("glDeleteRenderbuffers")
+#undef glDeleteRenderbuffers
+#pragma push_macro("glUseProgram")
+#undef glUseProgram
+#pragma push_macro("glDeleteProgram")
+#undef glDeleteProgram
+#pragma push_macro("glEnableVertexAttribArray")
+#undef glEnableVertexAttribArray
+#pragma push_macro("glDisableVertexAttribArray")
+#undef glDisableVertexAttribArray
+#pragma push_macro("glVertexAttribPointer")
+#undef glVertexAttribPointer
+#pragma push_macro("glVertexAttrib4f")
+#undef glVertexAttrib4f
+#pragma push_macro("glPixelStorei")
+#undef glPixelStorei
+static void scaleBlit(GLuint tex, float bw, float bh, int screenW, int screenH, GLuint& prog, GLint& texLoc, uint32_t frame) {
+    if (!prog) {
+        const char* vs =
+            "attribute vec2 a_pos; attribute vec2 a_uv; varying highp vec2 v_uv;\n"
+            "void main(){ gl_Position = vec4(a_pos, 0.0, 1.0); v_uv = a_uv; }\n";
+        const char* fs =
+            "precision mediump float; uniform sampler2D u_tex; varying highp vec2 v_uv;\n"
+            "void main(){ gl_FragColor = vec4(texture2D(u_tex, v_uv).rgb, 1.0); }\n";
+        GLuint v = 0, f = 0;
+        d3d9_gles::compileGLShader(GL_VERTEX_SHADER, vs, v, "scaler VS");
+        d3d9_gles::compileGLShader(GL_FRAGMENT_SHADER, fs, f, "scaler PS");
+        prog = glCreateProgram();
+        glAttachShader(prog, v);
+        glAttachShader(prog, f);
+        glBindAttribLocation(prog, 0, "a_pos");
+        glBindAttribLocation(prog, 1, "a_uv");
+        glLinkProgram(prog);
+        texLoc = glGetUniformLocation(prog, "u_tex");
+    }
+    // Fit the image into the screen as the player sees it (a rotated panel swaps width and height),
+    // keeping its aspect: black bars on the sides or top and bottom.
+    const bool rot = g_nfsScreenRotation == 90 || g_nfsScreenRotation == 270;
+    const float lw = static_cast<float>(rot ? screenH : screenW), lh = static_cast<float>(rot ? screenW : screenH);
+    float ex = 1.0f, ey = 1.0f;
+    if (bw / bh > lw / lh) ey = (lw / lh) / (bw / bh); else ex = (bw / bh) / (lw / lh);
+    struct V { float x, y, u, v; };
+    V q[4] = {{-ex, -ey, 0, 0}, {ex, -ey, 1, 0}, {-ex, ey, 0, 1}, {ex, ey, 1, 1}};
+    for (V& p : q) {
+        const float x = p.x, y = p.y;
+        if (g_nfsScreenRotation == 90) { p.x = y; p.y = -x; }
+        else if (g_nfsScreenRotation == 270) { p.x = -y; p.y = x; }
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glViewport(0, 0, screenW, screenH);
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_STENCIL_TEST);
+    glDisable(GL_CULL_FACE);
+    glDisable(GL_BLEND);
+    glDisable(GL_POLYGON_OFFSET_FILL);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    if (ex < 1.0f || ey < 1.0f) {
+        glClearColor(0, 0, 0, 1);
+        glClear(GL_COLOR_BUFFER_BIT);
+    }
+    glUseProgram(prog);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glUniform1i(texLoc, 0);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glEnableVertexAttribArray(0);
+    glEnableVertexAttribArray(1);
+    for (GLuint i = 2; i < 16; ++i) glDisableVertexAttribArray(i);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, sizeof(V), &q[0].x);
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, sizeof(V), &q[0].u);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    // Smoke tests: what the panel shows (after scaling), next to the back-buffer captures.
+    static const bool diag = std::getenv("NFSU2_DIAG_FRAMES") != nullptr;
+    if (diag && (frame == 1250 || frame == 1800 || frame == 2300)) {
+        std::vector<uint8_t> px(static_cast<size_t>(screenW) * screenH * 4);
+        glReadPixels(0, 0, screenW, screenH, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+        char path[64];
+        std::snprintf(path, sizeof path, "diag_screen_%u.ppm", frame);
+        if (FILE* fp = std::fopen(path, "wb")) {
+            std::fprintf(fp, "P6\n%d %d\n255\n", screenW, screenH);
+            for (int y = screenH - 1; y >= 0; --y)
+                for (int x = 0; x < screenW; ++x) std::fwrite(&px[(static_cast<size_t>(y) * screenW + x) * 4], 1, 3, fp);
+            std::fclose(fp);
+        }
+    }
+}
+
+#pragma pop_macro("glEnable")
+#pragma pop_macro("glDisable")
+#pragma pop_macro("glBlendFunc")
+#pragma pop_macro("glBlendFuncSeparate")
+#pragma pop_macro("glBlendEquation")
+#pragma pop_macro("glBlendEquationSeparate")
+#pragma pop_macro("glBlendColor")
+#pragma pop_macro("glDepthFunc")
+#pragma pop_macro("glDepthMask")
+#pragma pop_macro("glDepthRangef")
+#pragma pop_macro("glColorMask")
+#pragma pop_macro("glCullFace")
+#pragma pop_macro("glFrontFace")
+#pragma pop_macro("glPolygonOffset")
+#pragma pop_macro("glViewport")
+#pragma pop_macro("glScissor")
+#pragma pop_macro("glStencilFuncSeparate")
+#pragma pop_macro("glStencilOpSeparate")
+#pragma pop_macro("glStencilMask")
+#pragma pop_macro("glClearColor")
+#pragma pop_macro("glClearDepthf")
+#pragma pop_macro("glClearStencil")
+#pragma pop_macro("glActiveTexture")
+#pragma pop_macro("glBindTexture")
+#pragma pop_macro("glDeleteTextures")
+#pragma pop_macro("glBindBuffer")
+#pragma pop_macro("glDeleteBuffers")
+#pragma pop_macro("glBindFramebuffer")
+#pragma pop_macro("glDeleteFramebuffers")
+#pragma pop_macro("glBindRenderbuffer")
+#pragma pop_macro("glDeleteRenderbuffers")
+#pragma pop_macro("glUseProgram")
+#pragma pop_macro("glDeleteProgram")
+#pragma pop_macro("glEnableVertexAttribArray")
+#pragma pop_macro("glDisableVertexAttribArray")
+#pragma pop_macro("glVertexAttribPointer")
+#pragma pop_macro("glVertexAttrib4f")
+#pragma pop_macro("glPixelStorei")
+
+#ifndef __ANDROID__
+// Presenter thread (NFSU2_PRESENT_THREAD=0 turns it off).
+//
+// Without it the render thread ends every frame with SDL_GL_SwapWindow, and on the R36S's Mali that call
+// waits until the GPU has finished the whole frame (17-21 ms of an idle CPU in the device logs, swap
+// 0.3 ms when the GPU is already idle). The next frame's draw calls could not start before, so a frame cost
+// CPU time + GPU time (~24 + 19 ms) instead of the larger of the two.
+// Now the game draws into one of N off-screen back buffers; at Present the render thread flushes, puts a
+// fence behind the frame and hands the buffer to this thread, then starts the next frame in the next
+// buffer. This thread owns the window: it waits for the fence, scales the buffer onto the window and swaps
+// (blocking as long as the GPU needs). The render context is made surfaceless (EGL_KHR_surfaceless_context);
+// the two contexts share textures. Any missing piece leaves the old path in place.
+namespace presenter {
+constexpr int kMaxSlots = 3;
+struct Slot { GLuint tex = 0, fbo = 0; bool busy = false; };
+struct Item { int slot; GLuint tex; void* fence; float bw, bh; int sw, sh; uint32_t frame; };
+typedef void* (*PfnCur)(void);
+typedef unsigned (*PfnMakeCurrent)(void*, void*, void*, void*);
+typedef const char* (*PfnQueryString)(void*, int);
+typedef void* (*PfnFenceSync)(GLenum, GLbitfield);
+typedef GLenum (*PfnClientWait)(void*, GLbitfield, uint64_t);
+typedef void (*PfnDeleteSync)(void*);
+
+struct State {
+    bool tried = false, on = false;
+    int nSlots = 2, cur = 0;
+    Slot slots[kMaxSlots];
+    SDL_Window* window = nullptr;
+    SDL_Window* hidden = nullptr;   // test mode only (NFSU2_PRESENT_HIDDEN=1): where the render context sits instead of EGL surfaceless
+    SDL_GLContext ctx1 = nullptr, ctx2 = nullptr;
+    void* dpy = nullptr;
+    void* eglCtx1 = nullptr;
+    PfnMakeCurrent eglMakeCurrent = nullptr;
+    PfnFenceSync fenceSync = nullptr;
+    PfnClientWait clientWait = nullptr;
+    PfnDeleteSync deleteSync = nullptr;
+    std::thread th;
+    std::mutex m;
+    std::condition_variable cvItem, cvFree;
+    std::deque<Item> items;
+    bool stop = false, ready = false, failed = false;
+    std::atomic<uint64_t> waitSlotNs{0}, gpuWaitNs{0}, blitSwapNs{0}, frames{0};
+} S;
+
+bool wanted() {
+    const char* e = std::getenv("NFSU2_PRESENT_THREAD");
+    return !(e && e[0] == '0');
+}
+bool active() { return S.on; }
+int slotCount() { return S.nSlots; }
+GLuint currentFbo() { return S.slots[S.cur].fbo; }
+GLuint currentTex() { return S.slots[S.cur].tex; }
+
+static double ms(uint64_t ns, uint64_t n) { return n ? ns / 1e6 / n : 0.0; }
+
+static void threadMain() {
+    pthread_setname_np(pthread_self(), "present");
+    if (SDL_GL_MakeCurrent(S.window, S.ctx2) != 0) {
+        std::lock_guard<std::mutex> l(S.m);
+        S.failed = true;
+        S.cvFree.notify_all();
+        return;
+    }
+    SDL_GL_SetSwapInterval(1);
+    GLuint prog = 0;
+    GLint texLoc = -1;
+    {
+        std::lock_guard<std::mutex> l(S.m);
+        S.ready = true;
+        S.cvFree.notify_all();
+    }
+    uint64_t lastFrames = 0;
+    for (;;) {
+        Item it;
+        {
+            std::unique_lock<std::mutex> l(S.m);
+            S.cvItem.wait(l, [] { return S.stop || !S.items.empty(); });
+            if (S.items.empty()) break;
+            it = S.items.front();
+            S.items.pop_front();
+        }
+        using clk = std::chrono::steady_clock;
+        const auto t0 = clk::now();
+        if (it.fence) {
+            S.clientWait(it.fence, 1 /* GL_SYNC_FLUSH_COMMANDS_BIT */, 2000000000ull);
+            S.deleteSync(it.fence);
+        }
+        const auto t1 = clk::now();
+        scaleBlit(it.tex, it.bw, it.bh, it.sw, it.sh, prog, texLoc, it.frame);
+        SDL_GL_SwapWindow(S.window);
+        const auto t2 = clk::now();
+        {
+            std::lock_guard<std::mutex> l(S.m);
+            S.slots[it.slot].busy = false;
+        }
+        S.cvFree.notify_all();
+        S.gpuWaitNs += std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+        S.blitSwapNs += std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - t1).count();
+        const uint64_t n = ++S.frames;
+        if (n - lastFrames >= 300) {
+            const uint64_t d = n - lastFrames;
+            std::printf("[NFSU2 PRESENT] %llu frames, ms/frame: render thread waited for a free buffer %.1f, presenter waited for the GPU %.1f, blit + swap %.1f\n",
+                        static_cast<unsigned long long>(d), ms(S.waitSlotNs.exchange(0), d), ms(S.gpuWaitNs.exchange(0), d), ms(S.blitSwapNs.exchange(0), d));
+            lastFrames = n;
+        }
+    }
+    SDL_GL_MakeCurrent(S.window, nullptr);
+}
+
+// Runs once, on the thread that owns the GL context (render thread). false = old path, with the reason logged.
+bool init(SDL_Window* window, SDL_GLContext ctx1, int swapEffect) {
+    if (S.tried) return S.on;
+    S.tried = true;
+    if (!wanted()) { std::printf("[NFSU2 PRESENT] presenter thread off (NFSU2_PRESENT_THREAD=0)\n"); return false; }
+    auto fail = [](const char* why) { std::printf("[NFSU2 PRESENT] presenter thread not used: %s\n", why); return false; };
+    // eglGetProcAddress only has to know extension functions (older Mali drivers return null for core EGL and
+    // GLES3 names), so fall back to the libraries SDL already loaded.
+    auto lookup = [](const char* name) -> void* {
+        if (void* p = SDL_GL_GetProcAddress(name)) return p;
+        for (const char* lib : {"libEGL.so.1", "libEGL.so", "libGLESv2.so.2", "libGLESv2.so"})
+            if (void* h = dlopen(lib, RTLD_LAZY | RTLD_NOLOAD)) if (void* p = dlsym(h, name)) return p;
+        return nullptr;
+    };
+    auto eglGetCurrentDisplay = reinterpret_cast<PfnCur>(lookup("eglGetCurrentDisplay"));
+    auto eglGetCurrentContext = reinterpret_cast<PfnCur>(lookup("eglGetCurrentContext"));
+    auto eglQueryString = reinterpret_cast<PfnQueryString>(lookup("eglQueryString"));
+    S.eglMakeCurrent = reinterpret_cast<PfnMakeCurrent>(lookup("eglMakeCurrent"));
+    S.fenceSync = reinterpret_cast<PfnFenceSync>(lookup("glFenceSync"));
+    S.clientWait = reinterpret_cast<PfnClientWait>(lookup("glClientWaitSync"));
+    S.deleteSync = reinterpret_cast<PfnDeleteSync>(lookup("glDeleteSync"));
+    // Test mode for machines without EGL (the VM's SDL uses GLX): the render context sits on a hidden window.
+    const bool hiddenMode = std::getenv("NFSU2_PRESENT_HIDDEN") != nullptr;
+    if (!S.fenceSync || !S.clientWait || !S.deleteSync) return fail("no GL sync objects (needs OpenGL ES 3)");
+    if (!hiddenMode) {
+        if (!eglGetCurrentDisplay || !eglGetCurrentContext || !eglQueryString || !S.eglMakeCurrent) return fail("no EGL entry points");
+        S.dpy = eglGetCurrentDisplay();
+        S.eglCtx1 = eglGetCurrentContext();
+        if (!S.dpy || !S.eglCtx1) return fail("not an EGL context");
+        const char* ext = eglQueryString(S.dpy, 0x3055 /* EGL_EXTENSIONS */);
+        if (!ext || !std::strstr(ext, "EGL_KHR_surfaceless_context")) return fail("EGL_KHR_surfaceless_context missing");
+    }
+    {   // a fence must work on this context
+        while (glGetError() != GL_NO_ERROR) {}
+        void* f = S.fenceSync(0x9117 /* GL_SYNC_GPU_COMMANDS_COMPLETE */, 0);
+        glFlush();
+        const bool ok = f && glGetError() == GL_NO_ERROR;
+        if (f) { S.clientWait(f, 1, 1000000000ull); S.deleteSync(f); }
+        if (!ok) return fail("glFenceSync does not work on this context");
+    }
+    int n = 2;
+    if (const char* e = std::getenv("NFSU2_PRESENT_SLOTS")) n = std::atoi(e);
+    S.nSlots = n < 2 ? 2 : (n > kMaxSlots ? kMaxSlots : n);
+    S.window = window;
+    S.ctx1 = ctx1;
+    SDL_GL_SetAttribute(SDL_GL_SHARE_WITH_CURRENT_CONTEXT, 1);
+    S.ctx2 = SDL_GL_CreateContext(window);   // becomes current on this thread
+    SDL_GL_SetAttribute(SDL_GL_SHARE_WITH_CURRENT_CONTEXT, 0);
+    SDL_GL_MakeCurrent(window, ctx1);
+    if (!S.ctx2) return fail("could not create the second context");
+    auto rollback = [&]() {   // give the window back to the render context
+        SDL_GL_MakeCurrent(nullptr, nullptr);
+        SDL_GL_MakeCurrent(window, ctx1);
+        SDL_GL_DeleteContext(S.ctx2);
+        S.ctx2 = nullptr;
+        if (S.hidden) { SDL_DestroyWindow(S.hidden); S.hidden = nullptr; }
+    };
+    if (hiddenMode) {   // test mode: the render context sits on a hidden window
+        S.hidden = SDL_CreateWindow("hidden", 0, 0, 64, 64, SDL_WINDOW_OPENGL | SDL_WINDOW_HIDDEN);
+        if (!S.hidden || SDL_GL_MakeCurrent(S.hidden, ctx1) != 0) { rollback(); return fail("test mode: hidden window failed"); }
+    } else if (S.eglMakeCurrent(S.dpy, nullptr, nullptr, S.eglCtx1) != 1) {   // render context without the window
+        rollback();
+        return fail("eglMakeCurrent without a surface failed");
+    }
+    S.stop = S.ready = S.failed = false;
+    S.th = std::thread(threadMain);
+    {
+        std::unique_lock<std::mutex> l(S.m);
+        S.cvFree.wait_for(l, std::chrono::seconds(5), [] { return S.ready || S.failed; });
+    }
+    if (!S.ready) {
+        { std::lock_guard<std::mutex> l(S.m); S.stop = true; }
+        S.cvItem.notify_all();
+        if (S.th.joinable()) S.th.join();
+        rollback();
+        return fail("the presenter thread could not take the window");
+    }
+    S.on = true;
+    std::printf("[NFSU2 PRESENT] presenter thread on: %d back buffers, swap effect %d (NFSU2_PRESENT_THREAD=0 turns it off)\n", S.nSlots, swapEffect);
+    return true;
+}
+
+void setSlots(const GLuint* tex, const GLuint* fbo, int n) {
+    for (int i = 0; i < n; ++i) { S.slots[i].tex = tex[i]; S.slots[i].fbo = fbo[i]; S.slots[i].busy = false; }
+    S.cur = 0;
+}
+
+// Waits until the presenter has finished every frame handed to it.
+void drain() {
+    if (!S.on) return;
+    std::unique_lock<std::mutex> l(S.m);
+    S.cvFree.wait_for(l, std::chrono::seconds(10), [] {
+        if (!S.items.empty()) return false;
+        for (int i = 0; i < S.nSlots; ++i) if (S.slots[i].busy) return false;
+        return true;
+    });
+}
+
+void destroySlots() {
+    for (int i = 0; i < kMaxSlots; ++i) {
+        if (S.slots[i].fbo) glDeleteFramebuffers(1, &S.slots[i].fbo);
+        if (S.slots[i].tex) glDeleteTextures(1, &S.slots[i].tex);
+        S.slots[i] = Slot();
+    }
+    S.cur = 0;
+}
+
+// End of frame on the render thread: hand the finished buffer over and switch to the next free one.
+void submit(float bw, float bh, int sw, int sh, uint32_t frame) {
+    using clk = std::chrono::steady_clock;
+    Slot& s = S.slots[S.cur];
+    void* fence = S.fenceSync(0x9117, 0);
+    glFlush();
+    if (!fence) glFinish();
+    {
+        std::lock_guard<std::mutex> l(S.m);
+        s.busy = true;
+        S.items.push_back(Item{S.cur, s.tex, fence, bw, bh, sw, sh, frame});
+    }
+    S.cvItem.notify_one();
+    S.cur = (S.cur + 1) % S.nSlots;
+    const auto t0 = clk::now();
+    {
+        std::unique_lock<std::mutex> l(S.m);
+        if (!S.cvFree.wait_for(l, std::chrono::seconds(5), [] { return !S.slots[S.cur].busy; })) {
+            std::printf("[NFSU2 PRESENT] WARNING: the presenter did not release a buffer within 5 s\n");
+            S.slots[S.cur].busy = false;
+        }
+    }
+    S.waitSlotNs += std::chrono::duration_cast<std::chrono::nanoseconds>(clk::now() - t0).count();
+}
+
+void shutdown() {
+    if (!S.on) return;
+    drain();
+    {
+        std::lock_guard<std::mutex> l(S.m);
+        S.stop = true;
+    }
+    S.cvItem.notify_all();
+    if (S.th.joinable()) S.th.join();
+    S.on = false;
+    SDL_GL_MakeCurrent(nullptr, nullptr);    // the render context takes the window back
+    SDL_GL_MakeCurrent(S.window, S.ctx1);
+    if (S.ctx2) SDL_GL_DeleteContext(S.ctx2);
+    S.ctx2 = nullptr;
+    if (S.hidden) { SDL_DestroyWindow(S.hidden); S.hidden = nullptr; }
+}
+}  // namespace presenter
+#endif
+
 IDirect3DDevice9GLES::IDirect3DDevice9GLES(IDirect3D9GLES* parentD3D, SDL_Window* window, const D3DPRESENT_PARAMETERS& params)
     : m_parentD3D(parentD3D), m_sdlWindow(window), m_presentParams(params) {
     if (m_parentD3D) m_parentD3D->AddRef();
@@ -1041,6 +1501,7 @@ IDirect3DDevice9GLES::~IDirect3DDevice9GLES() {
         m_eglDisplay = EGL_NO_DISPLAY;
     }
 #else
+    presenter::shutdown();
     if (m_glContext && m_sdlWindow) SDL_GL_DeleteContext(m_glContext);
 #endif
     if (m_parentD3D) m_parentD3D->Release();
@@ -1491,6 +1952,17 @@ STDMETHODIMP IDirect3DDevice9GLES::Present(const RECT* pSourceRect, const RECT* 
         }
         bindRenderTarget();
     }
+#ifndef __ANDROID__
+    if (m_bbFbo && presenter::active()) {
+        const auto s0 = std::chrono::steady_clock::now();
+        presenter::submit(static_cast<float>(m_defaultBackBuffer->getWidth()), static_cast<float>(m_defaultBackBuffer->getHeight()), m_screenW, m_screenH, frame);
+        m_bbFbo = presenter::currentFbo();
+        m_bbTex = presenter::currentTex();
+        m_fboDirty = true;
+        nfsWaitAdd(3, std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - s0).count());
+        return D3D_OK;
+    }
+#endif
     if (m_bbFbo) presentBackBuffer();
     {
         glsc::DriverCpuTimer timer;
@@ -1598,6 +2070,13 @@ STDMETHODIMP IDirect3DDevice9GLES::StretchRect(IDirect3DSurface9* pSourceSurface
 // Screen scaler: a back buffer that is not the window
 // -----------------------------------------------------------------------------
 void IDirect3DDevice9GLES::destroyBackBufferTarget() {
+#ifndef __ANDROID__
+    if (presenter::active()) {
+        presenter::drain();
+        presenter::destroySlots();
+        m_bbFbo = m_bbTex = 0;
+    }
+#endif
     if (m_bbFbo) glDeleteFramebuffers(1, &m_bbFbo);
     if (m_bbTex) glDeleteTextures(1, &m_bbTex);
     if (m_bbDepth) glDeleteRenderbuffers(1, &m_bbDepth);
@@ -1619,18 +2098,19 @@ void IDirect3DDevice9GLES::createBackBufferTarget(UINT width, UINT height) {
     m_screenW = sw > 0 ? sw : static_cast<int>(width);
     m_screenH = sh > 0 ? sh : static_cast<int>(height);
     const bool forced = std::getenv("NFSU2_FORCE_SCALER") != nullptr;
-    if (!forced && g_nfsScreenRotation == 0 && m_screenW == static_cast<int>(width) && m_screenH == static_cast<int>(height)) {
+    // With the presenter thread the game always draws into off-screen buffers (the thread scales them onto the window).
+#ifndef __ANDROID__
+    if (m_sdlWindow && m_glContext) presenter::init(m_sdlWindow, m_glContext, static_cast<int>(m_presentParams.SwapEffect));
+    const bool ring = presenter::active();
+    const int count = ring ? presenter::slotCount() : 1;
+#else
+    const bool ring = false;
+    const int count = 1;
+#endif
+    if (!forced && !ring && g_nfsScreenRotation == 0 && m_screenW == static_cast<int>(width) && m_screenH == static_cast<int>(height)) {
         std::printf("[D3D9 GLES] back buffer %ux%u = screen: drawing straight into the window\n", width, height);
         return;
     }
-    glGenTextures(1, &m_bbTex);
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, m_bbTex);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     // Depth/stencil like the window's: the default depth surface's renderbuffer, else one of our own.
     GLuint rb = m_defaultDepthBuffer ? m_defaultDepthBuffer->getGLRenderbuffer() : 0;
     bool stencil = rb && m_defaultDepthBuffer->hasStencil();
@@ -1642,101 +2122,58 @@ void IDirect3DDevice9GLES::createBackBufferTarget(UINT width, UINT height) {
         glBindRenderbuffer(GL_RENDERBUFFER, 0);
         rb = m_bbDepth;
     }
-    glGenFramebuffers(1, &m_bbFbo);
-    glBindFramebuffer(GL_FRAMEBUFFER, m_bbFbo);
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, m_bbTex, 0);
-    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, rb);
-    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT, GL_RENDERBUFFER, stencil ? rb : 0);
-    const GLenum st = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    GLuint texs[3] = {0, 0, 0}, fbos[3] = {0, 0, 0};
+    GLenum st = GL_FRAMEBUFFER_COMPLETE;
+    for (int i = 0; i < count && st == GL_FRAMEBUFFER_COMPLETE; ++i) {
+        glGenTextures(1, &texs[i]);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, texs[i]);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glGenFramebuffers(1, &fbos[i]);
+        glBindFramebuffer(GL_FRAMEBUFFER, fbos[i]);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texs[i], 0);
+        glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, rb);
+        glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT, GL_RENDERBUFFER, stencil ? rb : 0);
+        st = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+        if (st == GL_FRAMEBUFFER_COMPLETE) {
+            glClearColor(0, 0, 0, 1);
+            glClear(GL_COLOR_BUFFER_BIT);
+        }
+    }
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     if (st != GL_FRAMEBUFFER_COMPLETE) {
         std::fprintf(stderr, "[D3D9 GLES] scaler framebuffer incomplete (0x%X): drawing straight into the %dx%d window\n", st, m_screenW, m_screenH);
-        destroyBackBufferTarget();
+        for (int i = 0; i < 3; ++i) {
+            if (fbos[i]) glDeleteFramebuffers(1, &fbos[i]);
+            if (texs[i]) glDeleteTextures(1, &texs[i]);
+        }
+        if (m_bbDepth) { glDeleteRenderbuffers(1, &m_bbDepth); m_bbDepth = 0; }
+        m_fboDirty = true;
+#ifndef __ANDROID__
+        if (ring) presenter::shutdown();
+#endif
         return;
     }
-    glClearColor(0, 0, 0, 1);
-    glBindFramebuffer(GL_FRAMEBUFFER, m_bbFbo);
-    glClear(GL_COLOR_BUFFER_BIT);
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    m_bbTex = texs[0];
+    m_bbFbo = fbos[0];
+#ifndef __ANDROID__
+    if (ring) presenter::setSlots(texs, fbos, count);
+#endif
     m_fboDirty = true;
-    std::printf("[D3D9 GLES] back buffer %ux%u scaled onto the %dx%d screen (rotation %u)\n", width, height, m_screenW, m_screenH, g_nfsScreenRotation);
+    std::printf("[D3D9 GLES] back buffer %ux%u scaled onto the %dx%d screen (rotation %u)%s\n", width, height, m_screenW, m_screenH, g_nfsScreenRotation,
+                ring ? ", shown by the presenter thread" : "");
 }
 
 void IDirect3DDevice9GLES::presentBackBuffer() {
     static GLuint prog = 0;
     static GLint texLoc = -1;
-    if (!prog) {
-        const char* vs =
-            "attribute vec2 a_pos; attribute vec2 a_uv; varying highp vec2 v_uv;\n"
-            "void main(){ gl_Position = vec4(a_pos, 0.0, 1.0); v_uv = a_uv; }\n";
-        const char* fs =
-            "precision mediump float; uniform sampler2D u_tex; varying highp vec2 v_uv;\n"
-            "void main(){ gl_FragColor = vec4(texture2D(u_tex, v_uv).rgb, 1.0); }\n";
-        GLuint v = 0, f = 0;
-        d3d9_gles::compileGLShader(GL_VERTEX_SHADER, vs, v, "scaler VS");
-        d3d9_gles::compileGLShader(GL_FRAGMENT_SHADER, fs, f, "scaler PS");
-        prog = glCreateProgram();
-        glAttachShader(prog, v);
-        glAttachShader(prog, f);
-        glBindAttribLocation(prog, 0, "a_pos");
-        glBindAttribLocation(prog, 1, "a_uv");
-        glLinkProgram(prog);
-        texLoc = glGetUniformLocation(prog, "u_tex");
-    }
-    const float bw = static_cast<float>(m_defaultBackBuffer->getWidth());
-    const float bh = static_cast<float>(m_defaultBackBuffer->getHeight());
-    // Fit the image into the screen as the player sees it (a rotated panel swaps width and height),
-    // keeping its aspect: black bars on the sides or top and bottom.
-    const bool rot = g_nfsScreenRotation == 90 || g_nfsScreenRotation == 270;
-    const float lw = static_cast<float>(rot ? m_screenH : m_screenW), lh = static_cast<float>(rot ? m_screenW : m_screenH);
-    float ex = 1.0f, ey = 1.0f;
-    if (bw / bh > lw / lh) ey = (lw / lh) / (bw / bh); else ex = (bw / bh) / (lw / lh);
-    struct V { float x, y, u, v; };
-    V q[4] = {{-ex, -ey, 0, 0}, {ex, -ey, 1, 0}, {-ex, ey, 0, 1}, {ex, ey, 1, 1}};
-    for (V& p : q) {
-        const float x = p.x, y = p.y;
-        if (g_nfsScreenRotation == 90) { p.x = y; p.y = -x; }
-        else if (g_nfsScreenRotation == 270) { p.x = -y; p.y = x; }
-    }
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    glViewport(0, 0, m_screenW, m_screenH);
-    glDisable(GL_SCISSOR_TEST);
-    glDisable(GL_DEPTH_TEST);
-    glDisable(GL_STENCIL_TEST);
-    glDisable(GL_CULL_FACE);
-    glDisable(GL_BLEND);
-    glDisable(GL_POLYGON_OFFSET_FILL);
-    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-    if (ex < 1.0f || ey < 1.0f) {
-        glClearColor(0, 0, 0, 1);
-        glClear(GL_COLOR_BUFFER_BIT);
-    }
-    glUseProgram(prog);
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, m_bbTex);
-    glUniform1i(texLoc, 0);
-    glBindBuffer(GL_ARRAY_BUFFER, 0);
-    glEnableVertexAttribArray(0);
-    glEnableVertexAttribArray(1);
-    for (GLuint i = 2; i < 16; ++i) glDisableVertexAttribArray(i);
-    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, sizeof(V), &q[0].x);
-    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, sizeof(V), &q[0].u);
-    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-    // Smoke tests: what the panel shows (after scaling), next to the back-buffer captures.
-    static const bool diag = std::getenv("NFSU2_DIAG_FRAMES") != nullptr;
-    const uint32_t frame = g_d3d9PresentCount;
-    if (diag && (frame == 1250 || frame == 1800 || frame == 2300)) {
-        std::vector<uint8_t> px(static_cast<size_t>(m_screenW) * m_screenH * 4);
-        glReadPixels(0, 0, m_screenW, m_screenH, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
-        char path[64];
-        std::snprintf(path, sizeof path, "diag_screen_%u.ppm", frame);
-        if (FILE* fp = std::fopen(path, "wb")) {
-            std::fprintf(fp, "P6\n%d %d\n255\n", m_screenW, m_screenH);
-            for (int y = m_screenH - 1; y >= 0; --y)
-                for (int x = 0; x < m_screenW; ++x) std::fwrite(&px[(static_cast<size_t>(y) * m_screenW + x) * 4], 1, 3, fp);
-            std::fclose(fp);
-        }
-    }
+    scaleBlit(m_bbTex, static_cast<float>(m_defaultBackBuffer->getWidth()), static_cast<float>(m_defaultBackBuffer->getHeight()),
+              m_screenW, m_screenH, prog, texLoc, g_d3d9PresentCount);
+    glsc::invalidate();   // the scaler talks to the driver directly
     // The scaler used its own program, attributes and bindings: force the next draw to re-apply them.
     m_currentProgram = nullptr;
     for (bool& e : m_attribEnabled) e = false;

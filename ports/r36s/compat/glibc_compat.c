@@ -52,6 +52,9 @@ extern void *compat_old_dlopen(const char *, int);
 extern void *compat_old_dlvsym(void *, const char *, const char *);
 __asm__(".symver compat_old_dlopen, dlopen@GLIBC_2.17");
 __asm__(".symver compat_old_dlvsym, dlvsym@GLIBC_2.17");
+/* the game code itself (libEGL/libGLESv2 lookup in the presenter) calls dlopen/dlsym */
+COMPAT_PIN(dlsym, "GLIBC_2.17");
+__asm__(".text\n.p2align 2\n.globl dlopen\n.hidden dlopen\n.type dlopen, %function\ndlopen:\n\tb compat_old_dlopen\n.size dlopen, .-dlopen\n");
 
 /* ---- 3. functions that only exist (or are plain symbols) on newer glibc ---------------------------- */
 struct stat;
