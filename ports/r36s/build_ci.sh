@@ -114,6 +114,19 @@ nm -u "$BUILD_DIR"/obj/*.o | awk '{print $2}' | grep -E '^gl[A-Z]' | sort -u | s
 nm -u "$BUILD_DIR"/obj/*.o | awk '{print $2}' | grep -E '^SDL_' | sort -u | sed 's/.*/void &(void){}/' > "$STUB/stub_sdl.c"
 "$CC" -shared -fPIC -o "$STUB/libSDL2.so" -Wl,-soname,libSDL2-2.0.so.0 "$STUB/stub_sdl.c"
 
+# 5b. glibc compatibility: old symbol versions pinned, crt1.o replaced, libstdc++/libgcc static
+CDIR="$BUILD_DIR/compat"; mkdir -p "$CDIR"
+LINKCOMPAT=""
+if [ -f "$ROOT/ports/r36s/compat/compat_start.S" ] && [ -f "$ROOT/ports/r36s/compat/glibc_compat.c" ]; then
+    "$CC" -O2 -fno-builtin -fno-stack-protector -c "$ROOT/ports/r36s/compat/glibc_compat.c" -o "$CDIR/glibc_compat.o"
+    "$CC" -c "$ROOT/ports/r36s/compat/compat_start.S" -o "$CDIR/compat_start.o"
+    "$CC" -dumpspecs | awk '/^\*startfile:/{f=1;print;next} /^\*/{f=0} f&&NF' \
+      | sed -E "s#([^A-Za-z/])crt1\.o%s#\1$CDIR/compat_start.o#g" > "$CDIR/compat.specs"
+    if grep -q "compat_start.o" "$CDIR/compat.specs"; then
+        LINKCOMPAT="-specs=$CDIR/compat.specs -static-libstdc++ -static-libgcc $CDIR/glibc_compat.o -Wl,--push-state,--no-as-needed -l:libpthread.so.0 -l:libdl.so.2 -l:librt.so.1 -Wl,--pop-state"
+    fi
+fi
+
 # 6. Link final binary
 OUT_NAME="${OUT_NAME:-nfsu2.aarch64}"
 echo "  LD $OUT/$OUT_NAME"
@@ -122,7 +135,7 @@ GUEST_OBJS=$(find "$GUEST_DIR" -name '*.o')
     "$BUILD_DIR"/obj/*.o \
     $GUEST_OBJS \
     -L"$STUB" \
-    -lSDL2 -lGLESv2 -lpthread -ldl -lm -rdynamic -no-pie
+    -lSDL2 -lGLESv2 -lpthread -ldl -lm -rdynamic -no-pie $LINKCOMPAT
 
 # 7. Strip and verify
 "$STRIP" --strip-debug "$OUT/$OUT_NAME"

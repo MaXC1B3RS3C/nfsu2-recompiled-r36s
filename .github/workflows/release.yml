@@ -73,15 +73,21 @@ jobs:
           if [ "$OBJS_FOUND" = "false" ]; then
             echo "[INFO] Checking for guest objects in repository releases..."
             for rel in "r36s-guest-objs" "r36s-base-assets"; do
-              if gh release download "$rel" -p "*.tar.gz" -D build/guest-archives --repo "${{ github.repository }}" 2>/dev/null; then
+              echo "[INFO] Querying release '$rel'..."
+              if gh release download "$rel" -p "*.tar.gz" -D build/guest-archives --repo "${{ github.repository }}"; then
+                echo "[SUCCESS] Downloaded archives from $rel"
                 OBJS_FOUND=true
                 break
               fi
             done
             if [ "$OBJS_FOUND" = "false" ]; then
-              if curl -fsSL "https://github.com/${{ github.repository }}/releases/download/r36s-base-assets/r36s-guest-objs.tar.gz" -o build/guest-archives/guest-objs.tar.gz 2>/dev/null; then
-                OBJS_FOUND=true
-              fi
+              echo "[INFO] Trying direct HTTPS download fallback..."
+              for arc in "guest-objs-v10.tar.gz" "guest-objs-v12.tar.gz" "r36s-guest-objs.tar.gz"; do
+                if curl -fsSL "https://github.com/${{ github.repository }}/releases/download/r36s-guest-objs/$arc" -o "build/guest-archives/$arc"; then
+                  echo "[SUCCESS] Downloaded $arc via direct HTTPS"
+                  OBJS_FOUND=true
+                fi
+              done
             fi
           fi
 
