@@ -17,6 +17,11 @@
 # ==============================================================================
 set -e
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# v10 addresses and file numbering only; any lift since config/hooks.txt listed these sites (both exes)
+# already has the hooks, so a v12 lift never needs this.
+if [ "$(python3 "$ROOT/scripts/exe_variant.py" current)" != "v10" ]; then
+  echo "inject_movie_hook.sh is for old v10 lifts only; this lift already has the FMV hooks"; exit 0
+fi
 PCRECOMP="${PCRECOMP:-$ROOT/../pcrecomp}"
 GUEST_DIR="${1:-$ROOT/build/ci-r36s/guest-objs}"
 SRC="$ROOT/src/recomp/gen/recomp_0021.c"

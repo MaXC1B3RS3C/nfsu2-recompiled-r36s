@@ -70,8 +70,20 @@ if(NFS_ANDROID_NATIVE)
         sub_0043C310 sub_0043C3B0 sub_0043BE50 sub_00576170 sub_005D3080 sub_005BBF20 sub_005BC010
         # fx_cache.c: D3DX preshader evaluation (skipped when its inputs did not change)
         sub_00664743)
+    # The names above are v10 addresses; turn them into those of the exe src/recomp/gen was lifted from
+    # (config/exe_functions.txt, src/recomp/gen/nfs_exe_variant.h).
+    execute_process(COMMAND "${Python3_EXECUTABLE}" "${NFS_ROOT}/scripts/exe_variant.py" names ${NFS_WRAPPED_FUNCTIONS}
+        RESULT_VARIABLE names_status OUTPUT_VARIABLE names_out ERROR_VARIABLE names_error OUTPUT_STRIP_TRAILING_WHITESPACE)
+    if(NOT names_status EQUAL 0)
+        message(FATAL_ERROR "exe_variant.py names failed: ${names_error}")
+    endif()
+    separate_arguments(NFS_WRAPPED_FUNCTIONS UNIX_COMMAND "${names_out}")
     list(JOIN NFS_WRAPPED_FUNCTIONS "," wrapped_list)
-    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${ANDROID_GEN_SOURCES} "${NFS_ROOT}/scripts/wrap_lifted.py")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${ANDROID_GEN_SOURCES} "${NFS_ROOT}/scripts/wrap_lifted.py"
+        "${NFS_ROOT}/scripts/exe_variant.py" "${NFS_ROOT}/config/exe_functions.txt")
+    if(EXISTS "${GEN_DIR}/nfs_exe_variant.h")
+        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${GEN_DIR}/nfs_exe_variant.h")
+    endif()
     execute_process(COMMAND "${Python3_EXECUTABLE}" "${NFS_ROOT}/scripts/wrap_lifted.py"
         "${CMAKE_CURRENT_BINARY_DIR}/wrapped_guest" "${wrapped_list}" ${ANDROID_GEN_SOURCES}
         RESULT_VARIABLE wrap_status OUTPUT_VARIABLE wrap_map ERROR_VARIABLE wrap_error OUTPUT_STRIP_TRAILING_WHITESPACE)

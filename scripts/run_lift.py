@@ -13,9 +13,14 @@
         recomp_dispatch.c      sorted VA -> function table (binary search)
         recomp_imports.c       IAT slot VA -> "dll!name" (for crash trails)
         lift_stats.json        counts for docs/LIFT_REPORT.md
+        recomp_variant.c       which SPEED2.EXE this is (config/exe_variants.txt)
+        nfs_exe_variant.h      the same, for src/runtime/nfs_exe_addr.h
+      The exe is recognised by its SHA-1 (or the .text SHA-1 of the analysis
+      copy); config/hooks.txt, overrides.txt and exclude.txt are read in its
+      column. An exe that is not listed stops the lift.
       --prefix P names a second module's output (P + every file and table
       above, e.g. server_recomp_dispatch_table for server.dll) so it links
-      next to SPEED2.EXE's.
+      next to SPEED2.EXE's; no SPEED2.EXE configuration applies to it.
 
 Everything written here is derived from the game binary and is gitignored.
 """
@@ -78,15 +83,8 @@ def rebuild(md, img, base, fd):
     return f
 
 
-def read_va_list(path):
-    out = {}
-    if path and os.path.exists(path):
-        for line in open(path):
-            line = line.split("#", 1)[0].strip()
-            if line:
-                parts = line.split(None, 1)
-                out[int(parts[0], 16)] = parts[1] if len(parts) > 1 else ""
-    return out
+sys.path.insert(0, HERE)
+import exe_variant                                  # noqa: E402
 
 
 def cmd_lift(exe, catalog, outdir, split=400, names_path=None, prefix=""):
@@ -104,10 +102,17 @@ def cmd_lift(exe, catalog, outdir, split=400, names_path=None, prefix=""):
     names = {}
     if names_path and os.path.exists(names_path):
         names = {int(k, 16): v for k, v in json.load(open(names_path)).items()}
-    cfg = os.path.join(HERE, "..", "config")
-    overrides = read_va_list(os.path.join(cfg, "overrides.txt"))
-    excluded = read_va_list(os.path.join(cfg, "exclude.txt"))
-    hooks = read_va_list(os.path.join(cfg, "hooks.txt"))
+    variant = None
+    overrides, excluded, hooks = {}, {}, {}
+    if not prefix:
+        variant = exe_variant.detect(exe)
+        if variant is None:
+            sys.exit(f"{exe} is not a SPEED2.EXE listed in config/exe_variants.txt (its addresses for hooks, "
+                     "overrides and native code are unknown); see docs/NFSU2_BINARY_REPORT.md")
+        print(f"[*] SPEED2.EXE variant {variant['id']} ({variant['size']} bytes)")
+        overrides = exe_variant.va_column("overrides.txt", variant)
+        excluded = exe_variant.va_column("exclude.txt", variant)
+        hooks = exe_variant.va_column("hooks.txt", variant)
     md = Cs(CS_ARCH_X86, CS_MODE_32)
     md.detail = True
     lifter = Lifter(iat_map=iat, func_names={}, lifted=lifted, precise_carry=True,
@@ -194,8 +199,11 @@ def cmd_lift(exe, catalog, outdir, split=400, names_path=None, prefix=""):
         for slot, (dll, nm) in sorted(iat.items()):
             fh.write(f'    {{ 0x{slot:08X}u, "{dll}!{nm}" }},\n')
         fh.write("    { 0, 0 } };\n")
+    if variant:
+        exe_variant.write_gen_files(outdir, variant, exe)
 
     out = {"functions": len(entries), "files": idx, "c_lines": lines_total,
+           "exe_variant": variant["id"] if variant else None,
            "lift_failures": len(failed), "failures": failed[:200],
            "unimplemented_total": sum(unimpl.values()),
            "unimplemented": dict(unimpl.most_common()),

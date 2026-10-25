@@ -13,6 +13,12 @@ struct SoundObject {
 std::map<uint32_t,SoundObject> soundObjects;
 std::map<uint32_t,uint32_t> soundMethodCalls;
 thread_local uint32_t soundToken{};
+// Diagnostics for silent or missing music ([NFSU2 AUDIO] lines): buffer creation, Play, Stop, and SetVolume /
+// SetPan when the value changes. Only the first audioLogBudget lines of a run are written.
+uint32_t audioLogBudget=1500;
+std::map<uint64_t,int32_t> audioLastValue;
+#define AUDIO_LOG(...) do { if(audioLogBudget){ --audioLogBudget; NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSU2 AUDIO",__VA_ARGS__); \
+    if(!audioLogBudget) NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSU2 AUDIO","log budget used up; later audio calls are not logged"); } } while(0)
 // Guards soundObjects/soundMethodCalls and every DirectSound object: buffer methods also run on the free
 // sound thread without the guest machine (R36S). soundDispatch never takes the machine while holding it.
 std::recursive_mutex soundStateMutex;
@@ -159,6 +165,7 @@ void soundDispatchBody(){
             if(!(flags&1)){voice->samples.resize(bytes,voice->bits==8?128:0);if(!soundMixer.add(voice)){ret(0x8878000a,4);return;}}
             uint32_t buffer=createSoundObject(2,flags);auto& created=soundObjects.at(buffer);created.voice=voice;
             if(!(flags&1)){created.guestSamples=allocate(bytes);std::memcpy(ptr(created.guestSamples,bytes),voice->samples.data(),bytes);}
+            AUDIO_LOG("CreateSoundBuffer #%u: flags=0x%x bytes=%u %u Hz %u ch %u bit%s",buffer,flags,bytes,voice->rate,voice->channels,voice->bits,(flags&1)?" (primary)":"");
             write32(output,buffer);ret(0,4);return;}
         case 4:{uint32_t out=arg(1);if(!out||read32(out)!=96){ret(0x80070057,2);return;}std::memset(ptr(out+4,92),0,92);
             // Match the PCM formats and continuous resampling we implement. The old
@@ -184,15 +191,26 @@ void soundDispatchBody(){
         if(second&&(!arg(5)||!arg(6))){ret(0x80070057,8);return;}
         object.locked=true;object.lockOffset=offset;object.lockBytes=length;
         write32(arg(3),object.guestSamples+offset);write32(arg(4),first);if(arg(5))write32(arg(5),second?object.guestSamples:0);if(arg(6))write32(arg(6),second);ret(0,8);return;}
-    case 12:{if(arg(1)||arg(2)||arg(3)&~1u){ret(0x80070057,4);return;}std::lock_guard<std::mutex> lock(soundMixer.mutex);voice->loop=arg(3)&1;voice->playing=true;ret(0,4);return;}
+    case 12:{if(arg(1)||arg(2)||arg(3)&~1u){ret(0x80070057,4);return;}std::lock_guard<std::mutex> lock(soundMixer.mutex);voice->loop=arg(3)&1;voice->playing=true;
+        unsigned active=0;for(auto& slot:soundMixer.voices)if(slot&&slot->playing)++active;
+        AUDIO_LOG("Play #%u: bytes=%u loop=%u volume=%d pan=%d frequency=%u, %u voices playing",self,unsigned(voice->samples.size()),unsigned(voice->loop),int(object.volume),int(object.pan),voice->frequency,active);
+        ret(0,4);return;}
     case 13:{if(arg(1)>=voice->samples.size()||arg(1)%voice->block()){ret(0x80070057,2);return;}std::lock_guard<std::mutex> lock(soundMixer.mutex);voice->position=arg(1)/voice->block();ret(0,2);return;}
     case 14:{if(!(object.flags&1)){ret(0x80070057,2);return;}std::lock_guard<std::mutex> lock(soundMixer.mutex);ret(soundFormat(arg(1),*voice)?0:soundBadFormat,2);return;}
     case 15:case 16:{int32_t value=int32_t(arg(1));if(value < -10000||value>(method==15?0:10000)){ret(0x80070057,2);return;}
         std::lock_guard<std::mutex> lock(soundMixer.mutex);if(method==15)object.volume=arg(1);else object.pan=arg(1);
         float gain=std::pow(10.f,int32_t(object.volume)/2000.f),pan=int32_t(object.pan);
-        voice->left=gain*(pan>0?std::pow(10.f,-pan/2000.f):1);voice->right=gain*(pan<0?std::pow(10.f,pan/2000.f):1);ret(0,2);return;}
+        voice->left=gain*(pan>0?std::pow(10.f,-pan/2000.f):1);voice->right=gain*(pan<0?std::pow(10.f,pan/2000.f):1);
+        uint64_t key=(uint64_t(self)<<1)|(method==16?1u:0u);
+        auto last=audioLastValue.find(key);
+        if(last==audioLastValue.end()||last->second!=value){
+            audioLastValue[key]=value;
+            if(method==15)AUDIO_LOG("SetVolume #%u: %d (%.1f dB, gain %.3f) bytes=%u playing=%u",self,value,value/100.0,double(gain),unsigned(voice->samples.size()),unsigned(voice->playing));
+            else AUDIO_LOG("SetPan #%u: %d bytes=%u playing=%u",self,value,unsigned(voice->samples.size()),unsigned(voice->playing));
+        }
+        ret(0,2);return;}
     case 17:{uint32_t frequency=arg(1)?arg(1):voice->rate;if(frequency<100||frequency>200000){ret(0x80070057,2);return;}std::lock_guard<std::mutex> lock(soundMixer.mutex);voice->frequency=frequency;ret(0,2);return;}
-    case 18:{std::lock_guard<std::mutex> lock(soundMixer.mutex);voice->playing=false;ret(0,1);return;}
+    case 18:{std::lock_guard<std::mutex> lock(soundMixer.mutex);voice->playing=false;AUDIO_LOG("Stop #%u: bytes=%u",self,unsigned(voice->samples.size()));ret(0,1);return;}
     case 19:{uint32_t bytes=uint32_t(voice->samples.size()),first=std::min(object.lockBytes,bytes-object.lockOffset),second=object.lockBytes-first;
         if(!object.locked||arg(1)!=object.guestSamples+object.lockOffset||arg(2)!=first||arg(3)!=(second?object.guestSamples:0)||arg(4)!=second){ret(0x80070057,5);return;}
         // Publish only what the guest locked. Copying the whole ring under the

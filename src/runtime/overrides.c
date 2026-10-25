@@ -12,6 +12,7 @@
 #include <string.h>
 #include "recomp_types.h"
 #include "nfs_runtime.h"
+#include "nfs_exe_addr.h"   /* v10 addresses -> the lifted exe's (config/exe_functions.txt) */
 
 /* VA of the indirect call in flight. The guest CPU state is one struct (g_cpu) when a build defines
  * RECOMP_TLS_STRUCT, otherwise separate thread-local variables; guest_runtime.cpp defines both. */
@@ -22,7 +23,7 @@ extern RECOMP_TLS uint32_t nfs_icall_va;
 #define ov_icall_va (nfs_icall_va)
 #endif
 
-/* 0x006F5FC5: Cyrix detection.
+/* 0x006F5D25 (v12 0x006F5FC5): Cyrix detection.
  *   xor eax,eax; sahf; mov eax,5; mov ebx,2; div bl; lahf; cmp ah,2; ...
  * Cyrix parts leave the flags untouched across DIV, so AH reads back 2 (the
  * value SAHF loaded, plus the always-set bit 1); Intel/AMD do not. DIV's flags
@@ -71,61 +72,61 @@ static __attribute__((unused)) void ov_fx_begin_pass(void) {  /* R36S only (NFSU
 
 /* Experiment: which effect methods 20..58 the game calls per frame, with which handles. */
 static const struct { int idx; uint32_t va; } k_fxMethods[] = {
-    {20, 0x0066C619u},
-    {21, 0x0066C685u},
-    {22, 0x0066DE12u},
-    {23, 0x0066DF0Cu},
-    {24, 0x0066DF9Eu},
-    {25, 0x0066E2DEu},
-    {26, 0x0066DA93u},
-    {27, 0x0066DC20u},
-    {28, 0x0066E5BDu},
-    {29, 0x0066E912u},
-    {30, 0x0066F215u},
-    {31, 0x0066F33Fu},
-    {32, 0x0066EBDCu},
-    {33, 0x0066EF72u},
-    {34, 0x0066D017u},
-    {35, 0x0066D277u},
-    {36, 0x0066C74Cu},
-    {37, 0x0066C90Fu},
-    {38, 0x0066CE4Eu},
-    {39, 0x0066CEE6u},
-    {40, 0x0066CA52u},
-    {41, 0x0066CAF2u},
-    {42, 0x0066CB51u},
-    {43, 0x0066CBF1u},
-    {44, 0x0066CF2Eu},
-    {45, 0x0066CFCFu},
-    {46, 0x0066CC50u},
-    {47, 0x0066CCF0u},
-    {48, 0x0066CD4Fu},
-    {49, 0x0066CDEFu},
-    {50, 0x0066D3CAu},
-    {51, 0x0066D465u},
-    {52, 0x0066D4FDu},
-    {53, 0x0066D5D1u},
-    {54, 0x0066D673u},
-    {55, 0x0066D7C8u},
-    {56, 0x0066D883u},
-    {57, 0x0066D9D8u},
-    {58, 0x0066C6E1u},
-    {59, 0x0065c819U},
-    {60, 0x00661ba0U},
-    {61, 0x0065c015U},
-    {62, 0x00660462U},
-    {63, 0x00660319U},
-    {64, 0x0066bd01U},
-    {70, 0x0065c848U},
-    {71, 0x0065c5aeU},
-    {72, 0x0065e257U},
-    {73, 0x00662075U},
-    {74, 0x0066208cU},
-    {75, 0x00665dd6U},
-    {76, 0x0065e571U},
-    {77, 0x0065e6d0U},
-    {78, 0x0067036fU},
-    {79, 0x00670b57U}
+    {20, NFS_VA(0x0066C619)},
+    {21, NFS_VA(0x0066C685)},
+    {22, NFS_VA(0x0066DE12)},
+    {23, NFS_VA(0x0066DF0C)},
+    {24, NFS_VA(0x0066DF9E)},
+    {25, NFS_VA(0x0066E2DE)},
+    {26, NFS_VA(0x0066DA93)},
+    {27, NFS_VA(0x0066DC20)},
+    {28, NFS_VA(0x0066E5BD)},
+    {29, NFS_VA(0x0066E912)},
+    {30, NFS_VA(0x0066F215)},
+    {31, NFS_VA(0x0066F33F)},
+    {32, NFS_VA(0x0066EBDC)},
+    {33, NFS_VA(0x0066EF72)},
+    {34, NFS_VA(0x0066D017)},
+    {35, NFS_VA(0x0066D277)},
+    {36, NFS_VA(0x0066C74C)},
+    {37, NFS_VA(0x0066C90F)},
+    {38, NFS_VA(0x0066CE4E)},
+    {39, NFS_VA(0x0066CEE6)},
+    {40, NFS_VA(0x0066CA52)},
+    {41, NFS_VA(0x0066CAF2)},
+    {42, NFS_VA(0x0066CB51)},
+    {43, NFS_VA(0x0066CBF1)},
+    {44, NFS_VA(0x0066CF2E)},
+    {45, NFS_VA(0x0066CFCF)},
+    {46, NFS_VA(0x0066CC50)},
+    {47, NFS_VA(0x0066CCF0)},
+    {48, NFS_VA(0x0066CD4F)},
+    {49, NFS_VA(0x0066CDEF)},
+    {50, NFS_VA(0x0066D3CA)},
+    {51, NFS_VA(0x0066D465)},
+    {52, NFS_VA(0x0066D4FD)},
+    {53, NFS_VA(0x0066D5D1)},
+    {54, NFS_VA(0x0066D673)},
+    {55, NFS_VA(0x0066D7C8)},
+    {56, NFS_VA(0x0066D883)},
+    {57, NFS_VA(0x0066D9D8)},
+    {58, NFS_VA(0x0066C6E1)},
+    {59, NFS_VA(0x0065C819)},
+    {60, NFS_VA(0x00661BA0)},
+    {61, NFS_VA(0x0065C015)},
+    {62, NFS_VA(0x00660462)},
+    {63, NFS_VA(0x00660319)},
+    {64, NFS_VA(0x0066BD01)},
+    {70, NFS_VA(0x0065C848)},
+    {71, NFS_VA(0x0065C5AE)},
+    {72, NFS_VA(0x0065E257)},
+    {73, NFS_VA(0x00662075)},
+    {74, NFS_VA(0x0066208C)},
+    {75, NFS_VA(0x00665DD6)},
+    {76, NFS_VA(0x0065E571)},
+    {77, NFS_VA(0x0065E6D0)},
+    {78, NFS_VA(0x0067036F)},
+    {79, NFS_VA(0x00670B57)}
 };
 static inline __attribute__((unused)) void recomp_call_va(uint32_t va) { recomp_func_t f = recomp_lookup(va); if (f) f(); }
 static uint32_t fxMethodCalls[80], fxFrame, fxFrames;
@@ -160,11 +161,11 @@ static void ov_fx_method(void) {
 }
 #endif /* NFS_R36S || NFS_FX_PRESHADER_ONLY */
 
-/* 0x0075CFD0: the static CRT memcpy/memmove(dst, src, n) (cdecl, returns dst).
+/* 0x0075CCF0 (v12 0x0075CFD0): the static CRT memcpy/memmove(dst, src, n) (cdecl, returns dst).
  * It handles overlap by copying backward, and reaches its unrolled dword moves
  * through computed jumps into the middle of straight-line blocks (tables at
- * 0x75D11C, 0x75D268, 0x75D2B8...). Not every target is a lifted entry, so an
- * overlapping move with 8+ dwords stopped at "ITAIL unresolved 0x0075D27C".
+ * v12 0x75D11C, 0x75D268, 0x75D2B8...). Not every target is a lifted entry, so an
+ * overlapping move with 8+ dwords stopped at "ITAIL unresolved 0x0075D27C" (v12).
  * Its contract is exactly the host memmove over guest memory. */
 static void ov_crt_memmove(void) {
     uint32_t dst = MEM32(g_esp + 4), src = MEM32(g_esp + 8), n = MEM32(g_esp + 12);
@@ -174,11 +175,11 @@ static void ov_crt_memmove(void) {
 }
 
 static const struct { uint32_t va; nfs_override_fn fn; } k_overrides[] = {
-    { 0x006F5FC5u, ov_is_cyrix },
+    { NFS_VA(0x006F5D25), ov_is_cyrix },
 #if defined(NFS_R36S)
-    { 0x0066A9F6u, ov_fx_begin_pass },
+    { NFS_VA(0x0066A9F6), ov_fx_begin_pass },
 #endif
-    { 0x0075CFD0u, ov_crt_memmove },
+    { NFS_VA(0x0075CCF0), ov_crt_memmove },
 };
 
 /* Called on every indirect call that misses its call-site cache (polymorphic vtable sites), and for every
@@ -205,20 +206,20 @@ static void ov_build(void) {
     const int stats = e && e[0] == '1';
     if (stats || nfs_fx_cache_mode() != 0)
         for (unsigned i = 0; i < sizeof k_fxMethods / sizeof k_fxMethods[0]; ++i)
-            if (k_fxMethods[i].va != 0x0065e26cu) ov_put(k_fxMethods[i].va, ov_fx_method);
+            if (k_fxMethods[i].va != NFS_VA(0x0065E26C)) ov_put(k_fxMethods[i].va, ov_fx_method);
     for (unsigned i = 0; i < sizeof k_overrides / sizeof k_overrides[0]; i++)
-        if (k_overrides[i].va != 0x0066A9F6u || stats) ov_put(k_overrides[i].va, k_overrides[i].fn);
+        if (k_overrides[i].va != NFS_VA(0x0066A9F6) || stats) ov_put(k_overrides[i].va, k_overrides[i].fn);
     /* lazy effect passes (hud_half.c): Begin, BeginPass, CommitChanges, EndPass, End of the D3DX effect */
     if (!stats && nfs_fx_lazy_enabled()) {
-        ov_put(0x006644A6u, nfs_fx_lazy_begin); ov_put(0x0066A9F6u, nfs_fx_lazy_begin_pass);
-        ov_put(0x0066A93Bu, nfs_fx_lazy_commit); ov_put(0x0065AAECu, nfs_fx_lazy_end_pass); ov_put(0x0065AA06u, nfs_fx_lazy_end);
+        ov_put(NFS_VA(0x006644A6), nfs_fx_lazy_begin); ov_put(NFS_VA(0x0066A9F6), nfs_fx_lazy_begin_pass);
+        ov_put(NFS_VA(0x0066A93B), nfs_fx_lazy_commit); ov_put(NFS_VA(0x0065AAEC), nfs_fx_lazy_end_pass); ov_put(NFS_VA(0x0065AA06), nfs_fx_lazy_end);
     }
 #else
     /* Android: the effect Set* hooks feed the preshader cache (fx_cache.c, NFS_FX_PRESHADER_ONLY). */
 #if defined(NFS_FX_PRESHADER_ONLY)
     if (nfs_fx_cache_mode() != 0)
         for (unsigned i = 0; i < sizeof k_fxMethods / sizeof k_fxMethods[0]; ++i)
-            if (k_fxMethods[i].va != 0x0065e26cu) ov_put(k_fxMethods[i].va, ov_fx_method);
+            if (k_fxMethods[i].va != NFS_VA(0x0065E26C)) ov_put(k_fxMethods[i].va, ov_fx_method);
 #endif
     for (unsigned i = 0; i < sizeof k_overrides / sizeof k_overrides[0]; i++)
         ov_put(k_overrides[i].va, k_overrides[i].fn);

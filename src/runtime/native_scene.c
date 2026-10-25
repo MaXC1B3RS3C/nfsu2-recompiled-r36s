@@ -24,6 +24,7 @@
  * the calls the lifted function makes.
  */
 #include "recomp_types.h"
+#include "nfs_exe_addr.h"   /* v10 addresses -> the lifted exe's (config/exe_functions.txt) */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -225,8 +226,9 @@ static uint32_t jumpShader[4];   /* the switch at 0x5C57D7 (shader type 0..3 -> 
 static void initJumpShader(void) {
     if (jumpShader[0]) return;
     for (uint32_t k = 0; k < 4; ++k) {
-        const uint32_t t = M32(0x5C58B8 + 4 * k);
-        jumpShader[k] = t == 0x5C57DE ? 0x86EB4C : t == 0x5C57E6 ? 0x86EB50 : t == 0x5C5813 ? 0x86EB58 : t == 0x5C581B ? 0x86EB54 : 0;
+        const uint32_t t = M32(NFS_VA(0x005C58B8) + 4 * k);
+        jumpShader[k] = t == NFS_VA(0x005C57DE) ? 0x86EB4C : t == NFS_VA(0x005C57E6) ? 0x86EB50 :
+                        t == NFS_VA(0x005C5813) ? 0x86EB58 : t == NFS_VA(0x005C581B) ? 0x86EB54 : 0;
     }
 }
 /* dry: no item calls (recorded into capList) and no write of [M+0x38]; returns 0 when the model had nothing */

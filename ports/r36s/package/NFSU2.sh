@@ -117,20 +117,35 @@ if [ -z "$EXE" ]; then
   exit 1
 fi
 
-# Verify exact executable version (European v1.2 No-CD required for static recompilation)
+# Verify the executable: the binary is built from one SPEED2.EXE (config/exe_variants.txt in the source) and
+# carries "NFSU2_EXE_BUILT_FOR=<id>:<size>". v10 (v1.0) is 4,788,224 bytes, v12 (European retail v1.2, No-CD) 4,800,512.
 EXESIZE=$(stat -c%s "$EXE" 2>/dev/null || wc -c < "$EXE" | tr -d ' ')
-if [ "$EXESIZE" != "4788224" ]; then
-  echo "[NFSU2 WARN] SPEED2.EXE size is $EXESIZE bytes (expected 4,788,224 for European v1.2)" >> "$GAMEDIR/log.txt" 2>&1
-  if [ "$EXESIZE" = "4800512" ]; then
-    printf "\033c" > "$CURR_TTY" 2>/dev/null || true
-    printf "======================================================================\n" > "$CURR_TTY" 2>/dev/null || true
-    printf " NOTICE: US v1.2 SPEED2.EXE detected (4,800,512 bytes)!\n" > "$CURR_TTY" 2>/dev/null || true
-    printf " This port was statically recompiled from the European v1.2 binary\n" > "$CURR_TTY" 2>/dev/null || true
-    printf " (4,788,224 bytes, MD5: 95b4dc3e9a6c72b06a8bd62b0c56ea63).\n" > "$CURR_TTY" 2>/dev/null || true
-    printf " The US binary may freeze during startup. Continuing in 4 seconds...\n" > "$CURR_TTY" 2>/dev/null || true
-    printf "======================================================================\n" > "$CURR_TTY" 2>/dev/null || true
-    sleep 4
-  fi
+# The release ships one binary per supported exe (nfsu2.aarch64.v10, nfsu2.aarch64.v12): take the one for
+# this SPEED2.EXE. Otherwise a binary built yourself (build.py), plain nfsu2.aarch64, is used.
+BIN=""
+case "$EXESIZE" in
+  4788224) [ -f "$GAMEDIR/nfsu2.aarch64.v10" ] && BIN="nfsu2.aarch64.v10" ;;
+  4800512) [ -f "$GAMEDIR/nfsu2.aarch64.v12" ] && BIN="nfsu2.aarch64.v12" ;;
+esac
+[ -n "$BIN" ] || BIN="nfsu2.aarch64"
+chmod 755 "$GAMEDIR/$BIN" 2>/dev/null || true
+BUILT=$(grep -a -o -m1 'NFSU2_EXE_BUILT_FOR=[a-z0-9]*:[0-9]*' "$GAMEDIR/$BIN" 2>/dev/null | head -n1 | cut -d= -f2)
+WANT_ID="${BUILT%%:*}"; WANT_SIZE="${BUILT##*:}"
+if [ -z "$BUILT" ]; then
+  WANT_ID="v10"; WANT_SIZE="4788224"   # binaries from before the marker were all lifted from v10
+fi
+[ "$WANT_ID" = "v12" ] && export NFSU2_PARALLEL_THREADS="${NFSU2_PARALLEL_THREADS:-7263c7}"
+echo "[NFSU2] SPEED2.EXE: $EXESIZE bytes; $BIN was built for $WANT_ID ($WANT_SIZE bytes)" >> "$GAMEDIR/log.txt" 2>&1
+if [ "$EXESIZE" != "$WANT_SIZE" ]; then
+  printf "\033c" > "$CURR_TTY" 2>/dev/null || true
+  printf "======================================================================\n" > "$CURR_TTY" 2>/dev/null || true
+  printf " ERROR: SPEED2.EXE does not match this build.\n" > "$CURR_TTY" 2>/dev/null || true
+  printf " Yours is %s bytes; %s was built from the %s exe\n" "$EXESIZE" "$BIN" "$WANT_ID" > "$CURR_TTY" 2>/dev/null || true
+  printf " (%s bytes). Use that SPEED2.EXE, or build the port from yours\n" "$WANT_SIZE" > "$CURR_TTY" 2>/dev/null || true
+  printf " (the 4,788,224-byte v1.0 and 4,800,512-byte v1.2 No-CD exes are supported).\n" > "$CURR_TTY" 2>/dev/null || true
+  printf "======================================================================\n" > "$CURR_TTY" 2>/dev/null || true
+  sleep 6
+  exit 1
 fi
 
 # Unbind vtconsole to allow KMSDRM full access to DRM primary plane
@@ -219,7 +234,8 @@ CAP_ARG="--cap60"; [ "$NFSU2_FPS" = "30" ] && CAP_ARG="--cap30"
 
 # Launch game: GLES 2.0 at the screen's native resolution (see Display above)
 LANG_ARG="--lang=$NFSU2_LANG"
-./nfsu2.aarch64 "$GAMEDIR/gamedata" $CAP_ARG $LANG_ARG > "$GAMEDIR/log.txt" 2>&1
+echo "[NFSU2] running $BIN" > "$GAMEDIR/log.txt"
+"./$BIN" "$GAMEDIR/gamedata" $CAP_ARG $LANG_ARG >> "$GAMEDIR/log.txt" 2>&1
 EXIT_CODE=$?
 
 # Get everything onto the card before the console returns to the menu (people often switch off right

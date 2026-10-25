@@ -48,3 +48,7 @@ src/recomp/gen_server/
 # Tester diagnostic reports
 NFSU2-diagnostico-*.zip
 
+
+# Python bytecode
+__pycache__/
+*.pyc

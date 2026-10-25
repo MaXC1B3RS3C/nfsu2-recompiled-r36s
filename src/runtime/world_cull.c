@@ -16,6 +16,7 @@
  * visibly pops. NFSU2_DRAW_DIST=0 (default for now) only counts.
  */
 #include "recomp_types.h"
+#include "nfs_exe_addr.h"   /* v10 addresses -> the lifted exe's (config/exe_functions.txt) */
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>

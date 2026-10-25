@@ -22,6 +22,7 @@
 #include "nfs_runtime.h"
 #include "nfs_widescreen.h"
 #include "nfs_log.h"
+#include "nfs_exe_addr.h"   /* NFS_EXE_ID / NFS_EXE_SIZE of the exe the lifted code comes from */
 
 char g_nfs_game_root[MAX_PATH];
 char g_nfs_exe_path[MAX_PATH];
@@ -29,7 +30,7 @@ char g_nfs_exe_path[MAX_PATH];
 extern native32_shim_t g_nfs_shims[];
 extern int g_nfs_nshims;
 
-#define GUEST_SPAN 0x00532000u   /* SizeOfImage of the tested SPEED2.EXE */
+#define GUEST_SPAN 0x00532000u   /* SizeOfImage of the larger listed SPEED2.EXE (v12; v10 is 0x52FBFA) */
 
 static int file_exists(const char *p) {
     DWORD a = GetFileAttributesA(p);
@@ -189,6 +190,14 @@ int main(int argc, char **argv) {
     if (!file_exists(g_nfs_exe_path)) {
         NFS_LOG(BOOT, "no SPEED2.EXE in %s", g_nfs_game_root);
         return 2;
+    }
+    {   /* the lifted code is tied to one exe of config/exe_variants.txt; another build runs into wrong code */
+        WIN32_FILE_ATTRIBUTE_DATA fa;
+        if (GetFileAttributesExA(g_nfs_exe_path, GetFileExInfoStandard, &fa) && (fa.nFileSizeHigh || fa.nFileSizeLow != NFS_EXE_SIZE)) {
+            NFS_LOG(BOOT, "SPEED2.EXE is %lu bytes, but this build was lifted from the %u-byte %s exe: use that exe, or lift yours",
+                    (unsigned long)fa.nFileSizeLow, NFS_EXE_SIZE, NFS_EXE_ID);
+            return 2;
+        }
     }
     SetCurrentDirectoryA(g_nfs_game_root);
     NFS_LOG(BOOT, "GAME_ROOT = %s", g_nfs_game_root);

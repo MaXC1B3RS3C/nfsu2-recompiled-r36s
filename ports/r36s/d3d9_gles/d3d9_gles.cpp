@@ -539,7 +539,7 @@ void perfThreadsReport(uint32_t frames, double wallMsPerFrame, double drawMsPerF
                 rows.push_back({name + "/" + std::to_string(tid), ms});
                 if (tid == g_gameTid.load()) gameMs += ms;
                 else if (name == "render") renderMs += ms;
-                else if (nfsParallelGuest() && name.find("-726117") != std::string::npos) freeMs += ms;  // free-running sound thread
+                else if (nfsParallelGuest() && (name.find("-726117") != std::string::npos || name.find("-7263c7") != std::string::npos)) freeMs += ms;  // free-running sound thread
                 // Other guest threads ("g<id>-<entry>") take turns with the game thread under the machine;
                 // host threads (SDL events/audio, GPU driver) have cores of their own.
                 else if (name.size() > 2 && name[0] == 'g' && name[1] >= '0' && name[1] <= '9') backgroundMs += ms;

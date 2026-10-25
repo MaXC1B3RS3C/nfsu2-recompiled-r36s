@@ -58,38 +58,53 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          mkdir -p build/guest-objs
+          mkdir -p build/guest-archives build/guest-objs
           OBJS_FOUND=false
 
           # 1. Check if user configured a direct URL secret
           if [ -n "${{ secrets.GUEST_OBJS_URL }}" ]; then
             echo "[INFO] Downloading guest objects from GUEST_OBJS_URL secret..."
-            if curl -fSL "${{ secrets.GUEST_OBJS_URL }}" -o guest-objs.tar.gz; then
+            if curl -fSL "${{ secrets.GUEST_OBJS_URL }}" -o build/guest-archives/guest-objs.tar.gz; then
               OBJS_FOUND=true
             fi
           fi
 
           # 2. Check if a base assets release exists on the repository
           if [ "$OBJS_FOUND" = "false" ]; then
-            echo "[INFO] Checking for r36s-guest-objs.tar.gz in repository releases..."
-            if gh release download r36s-base-assets -p "r36s-guest-objs.tar.gz" --repo "${{ github.repository }}" 2>/dev/null; then
-              mv r36s-guest-objs.tar.gz guest-objs.tar.gz
-              OBJS_FOUND=true
-            elif curl -fsSL "https://github.com/${{ github.repository }}/releases/download/r36s-base-assets/r36s-guest-objs.tar.gz" -o guest-objs.tar.gz; then
-              OBJS_FOUND=true
+            echo "[INFO] Checking for guest objects in repository releases..."
+            for rel in "r36s-guest-objs" "r36s-base-assets"; do
+              if gh release download "$rel" -p "*.tar.gz" -D build/guest-archives --repo "${{ github.repository }}" 2>/dev/null; then
+                OBJS_FOUND=true
+                break
+              fi
+            done
+            if [ "$OBJS_FOUND" = "false" ]; then
+              if curl -fsSL "https://github.com/${{ github.repository }}/releases/download/r36s-base-assets/r36s-guest-objs.tar.gz" -o build/guest-archives/guest-objs.tar.gz 2>/dev/null; then
+                OBJS_FOUND=true
+              fi
             fi
           fi
 
-          # 3. Extract or flag
-          if [ "$OBJS_FOUND" = "true" ] && [ -f guest-objs.tar.gz ]; then
-            tar -xzf guest-objs.tar.gz -C build/guest-objs
+          # 3. Extract each archive to its own directory
+          if [ "$OBJS_FOUND" = "true" ]; then
+            for archive in build/guest-archives/*.tar.gz; do
+              [ -f "$archive" ] || continue
+              bname=$(basename "$archive" .tar.gz)
+              mkdir -p "build/guest-objs/$bname"
+              tar -xzf "$archive" -C "build/guest-objs/$bname"
+            done
             COUNT=$(find build/guest-objs -name '*.o' | wc -l | tr -d ' ')
-            echo "[SUCCESS] Extracted $COUNT precompiled guest objects."
-            echo "HAVE_GUEST_OBJS=true" >> $GITHUB_ENV
+            if [ "$COUNT" -gt 0 ]; then
+              echo "[SUCCESS] Extracted $COUNT precompiled guest objects."
+              echo "HAVE_GUEST_OBJS=true" >> $GITHUB_ENV
+            else
+              echo "[WARNING] No *.o files found in archives."
+              echo "HAVE_GUEST_OBJS=false" >> $GITHUB_ENV
+            fi
           else
             echo "[WARNING] Precompiled guest objects not found."
             echo "To enable automated binary compilation in CI:"
-            echo "1. Upload 'dist/r36s-guest-objs.tar.gz' to a GitHub Release tagged 'r36s-base-assets'"
+            echo "1. Upload 'guest-objs-v10.tar.gz' or 'guest-objs-v12.tar.gz' to a GitHub Release tagged 'r36s-guest-objs' (or run: python build.py --export-guest --publish)"
             echo "   OR"
             echo "2. Add a repository secret named 'GUEST_OBJS_URL' with a direct download link."
             echo "HAVE_GUEST_OBJS=false" >> $GITHUB_ENV
@@ -98,10 +113,55 @@ jobs:
       - name: Build R36S Binary (ARM64)
         if: env.HAVE_GUEST_OBJS == 'true'
         run: |
-          GUEST_DIR="$GITHUB_WORKSPACE/build/guest-objs" \
-          BUILD_DIR="$GITHUB_WORKSPACE/build/ci-r36s" \
-          OUT="$GITHUB_WORKSPACE/ports/r36s/package" \
-          bash ports/r36s/build_ci.sh
+          OUT="$GITHUB_WORKSPACE/ports/r36s/package"
+          mkdir -p "$OUT"
+          for guest_dir in "$GITHUB_WORKSPACE"/build/guest-objs/*; do
+            [ -d "$guest_dir" ] || continue
+            cnt=$(find "$guest_dir" -name '*.o' | wc -l | tr -d ' ')
+            [ "$cnt" -gt 0 ] || continue
+
+            dname=$(basename "$guest_dir")
+            echo "============================================================"
+            echo " Building variant from $dname ($cnt objects)..."
+            echo "============================================================"
+
+            VARIANT=""
+            if [ -f "$guest_dir/guest.key" ]; then
+              VARIANT=$(grep -m1 '^variant ' "$guest_dir/guest.key" | awk '{print $2}')
+            fi
+            if [ -z "$VARIANT" ]; then
+              case "$dname" in
+                *v10*) VARIANT="v10" ;;
+                *v12*) VARIANT="v12" ;;
+              esac
+            fi
+
+            EXE_VAR=""
+            OUT_NAME="nfsu2.aarch64"
+            if [ "$VARIANT" = "v10" ]; then
+              OUT_NAME="nfsu2.aarch64.v10"
+              EXE_VAR="1"
+            elif [ "$VARIANT" = "v12" ]; then
+              OUT_NAME="nfsu2.aarch64.v12"
+              EXE_VAR="2"
+            fi
+
+            GUEST_DIR="$guest_dir" \
+            BUILD_DIR="$GITHUB_WORKSPACE/build/ci-r36s-$dname" \
+            OUT="$OUT" \
+            OUT_NAME="$OUT_NAME" \
+            NFS_EXE_VARIANT="$EXE_VAR" \
+            bash ports/r36s/build_ci.sh
+          done
+
+          # Ensure a fallback nfsu2.aarch64 exists if only versioned binaries were generated
+          if [ ! -f "$OUT/nfsu2.aarch64" ]; then
+            if [ -f "$OUT/nfsu2.aarch64.v12" ]; then
+              cp "$OUT/nfsu2.aarch64.v12" "$OUT/nfsu2.aarch64"
+            elif [ -f "$OUT/nfsu2.aarch64.v10" ]; then
+              cp "$OUT/nfsu2.aarch64.v10" "$OUT/nfsu2.aarch64"
+            fi
+          fi
 
       - name: Package PortMaster Release Bundle
         run: |
@@ -130,10 +190,15 @@ jobs:
             "- LANGUAGES/" \
             > "$STAGE_DIR/nfsu2/gamedata/COPY_RETAIL_PC_FILES_HERE.txt"
 
-          if [ "$HAVE_GUEST_OBJS" = "true" ] && [ -f "$GITHUB_WORKSPACE/ports/r36s/package/nfsu2.aarch64" ]; then
-            cp "$GITHUB_WORKSPACE/ports/r36s/package/nfsu2.aarch64" "$STAGE_DIR/nfsu2/"
-            echo "Package contains full native nfsu2.aarch64 binary."
-          else
+          BIN_COPIED=false
+          for b in "$GITHUB_WORKSPACE/ports/r36s/package"/nfsu2.aarch64*; do
+            if [ -f "$b" ]; then
+              cp "$b" "$STAGE_DIR/nfsu2/"
+              echo "Package contains $(basename "$b")."
+              BIN_COPIED=true
+            fi
+          done
+          if [ "$BIN_COPIED" = "false" ]; then
             echo "Package created without binary (base port configuration)."
           fi
 

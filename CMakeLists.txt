@@ -17,6 +17,14 @@ if(NOT GEN_SOURCES)
   message(FATAL_ERROR "No generated code in ${GEN_DIR}: run scripts/run_lift.py lift first")
 endif()
 
+# Which SPEED2.EXE the generated code was lifted from (run_lift.py writes it; config/exe_variants.txt). Said
+# explicitly because not every MSVC C mode has __has_include, which src/runtime/nfs_exe_addr.h uses otherwise.
+if(EXISTS "${GEN_DIR}/nfs_exe_variant.h")
+  file(STRINGS "${GEN_DIR}/nfs_exe_variant.h" _nfs_variant REGEX "^#define NFS_EXE_VARIANT [0-9]+")
+  string(REGEX REPLACE ".* ([0-9]+)$" "\\1" _nfs_variant "${_nfs_variant}")
+  add_compile_definitions(NFS_EXE_VARIANT=${_nfs_variant})
+  message(STATUS "lifted from SPEED2.EXE variant ${_nfs_variant} (config/exe_variants.txt)")
+endif()
 set(RT "${PCRECOMP}/runtime")
 set(COMMON_DEFS RECOMP_FLAT_MEMORY RECOMP_STRICT_ICALL RECOMP_NATIVE_RANGE _CRT_SECURE_NO_WARNINGS)
 set(COMMON_INC "${RT}/recomp32" "${RT}/native32" "${RT}/hybrid" "${CMAKE_SOURCE_DIR}/src/runtime"

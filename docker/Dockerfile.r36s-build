@@ -1,0 +1,20 @@
+# Lift SPEED2.EXE and build the R36S binary (nfsu2.aarch64) with Docker on Windows, macOS or Linux.
+# Use it through build.py at the repository root (see BUILD.md); docker/r36s_build.sh runs inside.
+# Ubuntu 22.04 like the CI and the aarch64 box the released binaries came from: GCC 11 and glibc 2.35, whose
+# symbol versions ports/r36s/compat pins down to what ArkOS 2.0 has.
+# On x86-64 hosts the aarch64 cross toolchain is installed; on arm64 hosts (Apple silicon, arm64 Linux) the
+# native GCC is already an aarch64 compiler and gets the aarch64-linux-gnu-* names the build scripts use.
+FROM ubuntu:22.04
+ENV DEBIAN_FRONTEND=noninteractive TZ=Etc/UTC
+RUN set -e; \
+    if [ "$(dpkg --print-architecture)" = "arm64" ]; then TC="gcc g++ binutils"; \
+    else TC="gcc-aarch64-linux-gnu g++-aarch64-linux-gnu binutils-aarch64-linux-gnu"; fi; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends $TC python3 python3-pip git ca-certificates; \
+    for t in gcc g++ nm strip objdump readelf; do \
+      command -v aarch64-linux-gnu-$t >/dev/null || ln -s "$(command -v $t)" /usr/local/bin/aarch64-linux-gnu-$t; \
+    done; \
+    aarch64-linux-gnu-gcc --version | head -1; \
+    rm -rf /var/lib/apt/lists/*
+RUN pip3 install --no-cache-dir "capstone>=5.0,<6" pefile
+WORKDIR /work

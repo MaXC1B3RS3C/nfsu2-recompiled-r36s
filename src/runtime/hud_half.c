@@ -8,6 +8,7 @@
  * NFSU2_HUD_HALF=0 turns it off.
  */
 #include "recomp_types.h"
+#include "nfs_exe_addr.h"   /* v10 addresses -> the lifted exe's (config/exe_functions.txt) */
 #include <stdio.h>
 #include <stdlib.h>
 extern void sub_005361B0_orig(void);

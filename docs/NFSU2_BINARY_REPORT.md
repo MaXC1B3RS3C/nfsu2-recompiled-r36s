@@ -1,28 +1,34 @@
 # SPEED2.EXE binary report
 
-## Target Recompiled Binary (European / Multi-Language v1.2)
-This is the binary from which all 27,758 functions in `src/recomp/gen/` (`catalog.json`) are generated and compiled:
+Two unpacked `SPEED2.EXE` builds are supported, v1.0 and v1.2 (`config/exe_variants.txt`). Each build of the port is
+lifted from one of them; see "Second exe" below for how they differ and how the hand-written code follows.
+
+## v10: the exe the port was first lifted from
+The binary the 27,758 catalogued functions of the original lift (`src/recomp/gen/`, `catalog.json`) came from:
 
 | Field | Value |
 |---|---|
-| Variant | European / Multi-Language v1.2 No-CD |
+| Variant | v1.0 No-CD (build stamp `Change 116661 on 2004/10/25`, `Oct 17 2004`), region not confirmed; earlier docs called it European v1.2 |
 | Size | **4,788,224 bytes** (~4.57 MB) |
+| SHA-1 | `f4bb0d9942815bb6e054e773994710c612acbc34` |
 | SHA-256 | `04b83e2d13c91c6ec294b578a08240ebcfff6fa9513df584edaa968e4ab9990c` |
 | MD5 | `95b4dc3e9a6c72b06a8bd62b0c56ea63` |
 | Analysis SHA-256 | `22aab4e461f15d2ad4df7c98ebb6b307976c3c7bba6d5c43b1510eb9c59fef8b` (`SPEED2.analysis.exe`) |
 | Entry point | **0x0075B9F1** (RVA `0x35B9F1`) |
+| SizeOfImage | 0x52FBFA |
 
-## Upstream Exploratory Binary (US v1.2)
-This binary was referenced in early upstream documentation before code lifting:
+## v12: European retail v1.2, SecuROM removed
+Earlier docs called this one "US v1.2". It is the European retail exe unpacked: all 13,357 code pointers in
+its `.rdata` are identical to those of the retail European `SPEED2.EXE` (5,987,978 bytes, SecuROM-wrapped,
+sha1 `6f5dfa7d0653db2511ea0bab80eea5a94502a50c`, from a European disc); the 1,230 differing `.rdata` bytes are
+the import table. The retail exe's own `.text` and `.data` are encrypted, so it cannot be lifted directly.
 
 | Field | Value |
 |---|---|
-| Variant | US v1.2 No-CD |
-| Path (local) | `Need for Speed Underground 2/SPEED2.EXE` |
 | Size | 4,800,512 bytes |
+| SHA-1 | `c92e5c568a42dbf2d733e0d9b9dc9ca09794a36c` |
 | SHA-256 | `f9dd86c054878ce6276beb07c1fd61874f7a1e4bf1f241b084c65b73e24168a7` |
 | MD5 | `6445adbf4e8d64be51e96a69bba168a4` |
-| File mtime | 2005-03-08 |
 | Machine | i386, PE32, GUI subsystem 4.0 |
 | ImageBase | 0x00400000 (FileHeader has RELOCS_STRIPPED set) |
 | Entry point | 0x0075BCC7 (RVA 0x35BCC7) — MSVC `WinMainCRTStartup` shape (`push 0x18; push 0x7D3998; call __SEH_prolog`) |
@@ -35,7 +41,38 @@ This binary was referenced in early upstream documentation before code lifting:
 | Version resource | none |
 | Embedded build date | `Feb  9 2005` (string next to the online-protocol `VERS` field) |
 
+## Second exe (2026-10-24)
+
+v10 carries the build stamp `Change 116661 on 2004/10/25` (`Oct 17 2004`, the original release); v12 carries
+`Change 126890 on 2005/02/09 ... 'Bump PC version number.'` (the v1.2 patch). They share the same section table (`.text` 0x401000, `.rdata` 0x783000, `.data` 0x7E8000, `.rsrc` 0x8BC000; `.text` is
+0x381821 bytes in v10, 0x381AF1 in v12): v1.2 is the v1.0 code plus the patch changes, relinked:
+
+- **Code** moves by a varying amount (+0x70 near 0x48B000, +0x370 near 0x536000, +0x2D4 at `_ftol2`,
+  +0x3465 for the D3DX library), and a few functions exist in only one build or were folded differently.
+  Aligning the two disassemblies pairs 1,229,515 of ~1,242,000 instructions (3,135 differing stretches).
+- **Data** keeps its addresses except the import table and a few `.rdata` tables (±4 to ±0x14 bytes,
+  around 0x798FC4–0x79B2F0 and in the D3DX constants). Every data address the hand-written code uses was
+  checked against the instructions that reference it in both exes; only fHudScaleX moved (0x79AC0C / 0x79AC10).
+
+`scripts/exe_addr_map.py` derives the map (aligned instructions, call and data operands inside them, and the
+15,529 code-pointer slots at the same place in both exes' data). `config/exe_functions.txt` and the second
+columns of `config/hooks.txt`, `overrides.txt` and `exclude.txt` come from it, and
+`scripts/exe_variant.py check v10.exe v12.exe` re-derives every row (0 disagreements). Every function the
+native code replaces or calls (123) has the same instructions, data operands and mapped code operands in
+both exes up to its last `ret`; the 28 v12 hook cases written earlier in `widescreen.c` by hand agree with
+the map, and the shader jump table at 0x5C58B8 / 0x5C5BE8 holds the mapped case targets.
+
+Found on the way (both exes):
+- `config/overrides.txt` and `exclude.txt` held v12 addresses only (the Cyrix probe 0x6F5FC5, CRT
+  memcpy 0x75CFD0, the data-as-code body 0x6D5610). They are not function starts in v10, so v10 lifts
+  never applied them; the v10 column now names the same code (0x6F5D25, 0x75CCF0, 0x6D5390).
+- `widescreen.c` wrote the HUD X scale to both 0x79AC0C and 0x79AC10, clobbering the neighbouring
+  constant of whichever exe ran; it now writes the running exe's address only.
+- The seven 4:3 FMV/title-card hook cases in `widescreen.c` had v10 addresses only.
+
 ## Sections
+
+As analysed on v12; v10 has the same first five sections (`.text` VirtualSize 0x381821, no trailing import section).
 
 | Name | VA | VirtualSize | Raw | Flags | Notes |
 |---|---|---|---|---|---|

@@ -22,6 +22,7 @@
  * (evaluate everything, count would-be-wrong skips). NFSU2_FX_CACHE=0 turns it off.
  */
 #include "recomp_types.h"
+#include "nfs_exe_addr.h"   /* v10 addresses -> the lifted exe's (config/exe_functions.txt) */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

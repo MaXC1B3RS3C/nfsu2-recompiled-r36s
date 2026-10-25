@@ -9,6 +9,7 @@
 #if defined(__ANDROID__) || defined(NFS_D3D9_BACKEND)
 #include "d3d9_bridge.h"
 #include "nfs_widescreen.h"
+#include "nfs_exe_addr.h"   // v10 addresses -> the lifted exe's (config/exe_functions.txt)
 #endif
 #include <array>
 #include <utility>
@@ -123,13 +124,23 @@ struct Import { std::string name; recomp_func_t function{}; uint64_t calls{}; bo
 // turns on one core. Enabled right before the game's entry point; NFSU2_PARALLEL_GUEST=0 disables it.
 bool parallelGuest=false;
 // Which guest threads run without the machine ("free"): only those whose entry point is listed in
-// NFSU2_PARALLEL_THREADS (default 726117, the game's 100 Hz sound/streaming thread). The game's main
+// NFSU2_PARALLEL_THREADS (default NFS_SOUND_THREAD_ENTRY: 726117 in v1.0, 7263c7 in v1.2, the game's 100 Hz
+// sound/streaming thread). The game's main
 // thread and its other workers keep taking turns under the machine: x86 orders stores for every other
 // core (TSO), ARM does not, and lifted code has no barriers, so threads that hand data to each other
 // through plain memory flags (the movie decoder did: a garbage pointer during the EA logo) must not run
 // at the same time. The sound thread talks to the game through Win32 mutexes (barriers in the runtime).
 thread_local bool freeRunning=false;
 std::vector<uint32_t> freeThreadEntries;
+// Entry point of the game's 100 Hz sound/streaming thread, one per SPEED2.EXE (exe_addr_map.py maps 0x00726117
+// in v1.0 to 0x007263C7 in v1.2). With the v1.0 address on v1.2 the thread never ran free: it took turns with the
+// game thread under the machine, which then waited ~6 ms per frame for it (~25 fps instead of ~27) and the
+// sound thread was starved.
+#if defined(NFS_EXE_VARIANT) && NFS_EXE_VARIANT==2
+#define NFS_SOUND_THREAD_ENTRY "7263c7,726117"
+#else
+#define NFS_SOUND_THREAD_ENTRY "726117,7263c7"
+#endif
 std::unique_ptr<GuestMemory> memory;
 std::unique_ptr<GuestHeaps> heaps;
 // The guest machine lock: FIFO by ticket and recursive per thread, with the
@@ -679,6 +690,9 @@ void bindImports(uint32_t base, uint32_t size, uint32_t directoryRva, uint32_t d
     }
     if (!terminated) throw GuestStop("Unterminated PE import descriptors");
 }
+extern "C" const char nfs_exe_lifted_from[] __attribute__((weak));   // recomp_variant.c
+// The launcher (ports/r36s/package/NFSU2.sh) finds this string in the binary to check the exe before starting.
+extern "C" __attribute__((used)) const char nfs_exe_built_for[] = NFS_EXE_BUILT_FOR;
 void loadImage(const char* path) {
     std::ifstream stream(path,std::ios::binary);
     if (!stream) throw GuestStop("Cannot open game PE");
@@ -692,6 +706,18 @@ void loadImage(const char* path) {
     resourceRva=opt.DataDirectory[2].VirtualAddress;resourceSize=opt.DataDirectory[2].Size;
     if (imageBase!=0x400000 || (opt.AddressOfEntryPoint!=0x35bcc7 && opt.AddressOfEntryPoint!=0x35b9f1))
         throw GuestStop("PE layout does not match generated NFSU2 code");
+    // The lifted code (recomp_variant.c, written by run_lift.py), the native helpers (nfs_exe_addr.h) and the
+    // SPEED2.EXE mapped here must all be the same build: a lift of one exe runs the other's data into wrong code.
+    {
+        const char* lifted = nfs_exe_lifted_from ? nfs_exe_lifted_from : "v10";   // lifts before 2026-10-24: v10
+        if (std::strcmp(lifted, NFS_EXE_ID) != 0)
+            throw GuestStop(std::string("Native code built for SPEED2.EXE ")+NFS_EXE_ID+" but the lifted code is from "+lifted+
+                            ": rebuild after the lift (src/runtime/nfs_exe_addr.h follows src/recomp/gen)");
+        if (file.size() != NFS_EXE_SIZE)
+            throw GuestStop("SPEED2.EXE is "+std::to_string(file.size())+" bytes, but this build was lifted from the "+
+                            std::to_string(NFS_EXE_SIZE)+"-byte "+NFS_EXE_ID+" exe: use that exe, or lift yours (config/exe_variants.txt)");
+        NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSU2","SPEED2.EXE %s (%zu bytes) matches the lifted code",NFS_EXE_ID,file.size());
+    }
     if (imageSize < 0x532000) imageSize = 0x532000;
     memory->commit(imageBase,imageSize);
     imageRange(0,opt.SizeOfHeaders);
@@ -1111,7 +1137,7 @@ recomp_func_t lookupImportLocked(uint32_t va) {
     return imports[index].function;
 }
 extern "C" void recomp_unresolved(const char* kind,uint32_t va,uint32_t from) {
-    if(from==0x00725520u&&memory){
+    if(from==NFS_VA(0x00725270)&&memory){   // the audio callback dispatcher
         uint32_t node=read32(0x8b446c);
         for(unsigned i=0;i<12&&node&&memory->readable(node,16);++i){
             NFS_RUNTIME_LOG(ANDROID_LOG_WARN,"NFSU2","Audio callback node=%08x next=%08x prev=%08x function=%08x data=%08x",node,read32(node),read32(node+4),read32(node+8),read32(node+12));
@@ -1150,7 +1176,7 @@ void configureAndroidResolutionModes(){
     write32(0x870d1c,5);
 }
 #if defined(NFS_R36S)
-// GetRacingResolution(int* w, int* h) is sub_005BF2E0 in the lifted SPEED2.EXE (stdcall, ret 8). It returns
+// GetRacingResolution(int* w, int* h) is sub_005BF2E0 in v10 (renamed per exe by nfs_exe_addr.h; stdcall, ret 8). It returns
 // fixed sizes per menu slot (640x480 for slot 0); the R36S build renames the lifted function *_orig
 // (build_guest_vm.sh wrap list) and answers with the size main.cpp chose for this screen.
 extern "C" void sub_005BF2E0_orig(void);
@@ -1244,9 +1270,9 @@ std::string connectGuestRuntime(const char* executable) {
 #if !defined(NFS_R36S)
         if(renderWidth.load()&&renderHeight.load()){
             uint32_t outputs=allocate(12);write32(outputs+8,0xdeadbeef);
-            callGuest(0x005bf2e0,{outputs,outputs+4});
+            callGuest(NFS_VA(0x005BF2E0),{outputs,outputs+4});
             if(read32(outputs)!=renderWidth.load()||read32(outputs+4)!=renderHeight.load()||read32(outputs+8)!=0xdeadbeef)throw GuestStop("Guest resolution ABI failed");
-            for(uint32_t i=0;i<6;++i){write32(0x870d1c,i);callGuest(0x005bf2e0,{outputs,outputs+4});
+            for(uint32_t i=0;i<6;++i){write32(0x870d1c,i);callGuest(NFS_VA(0x005BF2E0),{outputs,outputs+4});
                 if(read32(outputs)!=guestRenderModes[i].width||read32(outputs+4)!=guestRenderModes[i].height||read32(outputs+8)!=0xdeadbeef)throw GuestStop("Guest resolution slot/guard check failed");}
             write32(0x870d1c,5);firstGameResolution=true;
             heaps->free(GuestHeaps::process,outputs);
@@ -1278,7 +1304,7 @@ std::string connectGuestRuntime(const char* executable) {
                     else if(ends("!LeaveCriticalSection"))import.freeFunction=leaveCritical;
                     if(import.freeFunction)++marked;
                 }
-                const char* list=std::getenv("NFSU2_PARALLEL_THREADS");std::string entries=list?list:"726117";
+                const char* list=std::getenv("NFSU2_PARALLEL_THREADS");std::string entries=list?list:NFS_SOUND_THREAD_ENTRY;
                 for(size_t at=0;at<entries.size();){size_t end=entries.find_first_of(",; ",at);if(end==std::string::npos)end=entries.size();
                     if(end>at)freeThreadEntries.push_back(static_cast<uint32_t>(std::strtoul(entries.substr(at,end-at).c_str(),nullptr,16)));at=end+1;}
                 parallelGuest=true;

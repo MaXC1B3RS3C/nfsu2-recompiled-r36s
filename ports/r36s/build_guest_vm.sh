@@ -45,6 +45,28 @@ for f in "$ROOT"/src/recomp/gen/recomp_*.c; do
     SRCS+=("$f")
   fi
 done
+# Lifted functions replaced by native code (fx_cache.c / hud_half.c / world_cull.c / native_math.c / native_scene.c
+# / guest_runtime.cpp), named by their v10 address; scripts/exe_variant.py turns them into the names of the exe
+# src/recomp/gen was lifted from. Their definitions are renamed *_orig in a copy of the source that defines them,
+# so every caller, in any file, reaches the native version.
+WRAP_V10="sub_00664743 sub_00668FAA sub_006689E4 sub_00668EC5 sub_005361B0 sub_005CF150 sub_005D3080 sub_005BF2E0
+ sub_005C5600 sub_005CE860 sub_0075BC00 sub_00401310 sub_00401430 sub_00689A17 sub_00440FF0 sub_0043CA20 sub_0043D250
+ sub_0043CA30 sub_00440EA0 sub_0043C310 sub_0043C3B0 sub_0043BE50 sub_00576170 sub_005D6700 sub_005D62C0 sub_005BBF20
+ sub_005BC010"
+WRAP="$(python3 "$ROOT/scripts/exe_variant.py" names $WRAP_V10)" || { echo "ERROR: exe_variant.py names failed"; exit 1; }
+echo "lifted from SPEED2.EXE $(python3 "$ROOT/scripts/exe_variant.py" current)"
+# Which source defines each wrapped function (rebuilt when the lifted code changes); each must be defined once.
+WRAPMAP="$GUEST_OUT/.wrap-map"
+if [ ! -f "$WRAPMAP" ] || [ -n "$(find "$ROOT/src/recomp/gen" "$SPLIT" -name 'recomp_*.c' -newer "$WRAPMAP" 2>/dev/null | head -1)" ]; then
+  grep -oE "^void ($(echo $WRAP | tr ' ' '|'))\(void\) \{\$" "${SRCS[@]}" \
+    | sed -E 's#^(.*):void (sub_[0-9A-F]{8})\(void\) \{$#\2 \1#' > "$WRAPMAP.tmp" || true
+  for w in $WRAP; do
+    n=$(grep -c "^$w " "$WRAPMAP.tmp" || true); [ "$n" = 1 ] || { echo "ERROR: $w is defined $n times in the lifted code"; rm -f "$WRAPMAP.tmp"; exit 1; }
+  done
+  mv "$WRAPMAP.tmp" "$WRAPMAP"
+fi
+# The largest lifted source holds a handful of enormous functions (recomp_0034.c in the v10 lift); its parts get BIG_OPT.
+BIGSTEM="$(basename "$(ls -S "$ROOT"/src/recomp/gen/recomp_*.c | head -1)" .c)"
 HDR="$ROOT/android/app/src/main/cpp/arm64_guest.h"
 fresh() { [ -f "$1" ] && [ "$1" -nt "$2" ] && [ "$1" -nt "$HDR" ]; }
 start=$(date +%s)
@@ -53,27 +75,8 @@ for src in "${SRCS[@]}"; do
   fresh "$obj" "$src" && continue
   [ $(( $(date +%s) - start )) -ge "$BUDGET" ] && break
   while [ "$(jobs -rp | wc -l)" -ge "$JOBS" ]; do sleep 0.5; done
-  F="$FLAGS"; case "$(basename "$src")" in recomp_0034_part_*) F="$FLAGS $BIG_OPT";; esac
-  # Lifted functions replaced by a native wrapper (src/runtime/fx_cache.c): the definition is renamed
-  # *_orig; every caller lives in another file, so their calls reach the wrapper.
-  case "$(basename "$src")" in recomp_0039.c) F="$F -Dsub_00664743=sub_00664743_orig";; esac
-  # Wrapped functions whose callers are in their own file: only the definition is renamed *_orig, in a
-  # copy of the source (the callers then reach the native wrapper). fx_cache.c / hud_half.c / world_cull.c /
-  # native_math.c / native_scene.c.
-  cc_src="$src"; wrap=""
-  case "$(basename "$src")" in
-    recomp_0040.c) wrap="sub_00668FAA sub_006689E4 sub_00668EC5";;
-    recomp_0021.c) wrap="sub_005361B0";;
-    recomp_0029.c) wrap="sub_005CF150 sub_005D3080 sub_005BF2E0 sub_005C5600 sub_005CE860";;  # sub_005BF2E0: GetRacingResolution (guest_runtime.cpp); the last two: native_scene.c
-    recomp_0057.c) wrap="sub_0075BC00";;
-    recomp_0000.c) wrap="sub_00401310 sub_00401430";;
-    recomp_0042_part_001.c) wrap="sub_00689A17";;
-    recomp_0004.c) wrap="sub_00440FF0 sub_0043CA20 sub_0043D250 sub_0043CA30 sub_00440EA0";;  # sub_00440EA0: native_scene.c
-    recomp_0003.c) wrap="sub_0043C310 sub_0043C3B0 sub_0043BE50";;
-    recomp_0024.c) wrap="sub_00576170";;
-    recomp_0030.c) wrap="sub_005D6700 sub_005D62C0";;  # native_scene.c
-    recomp_0028.c) wrap="sub_005BBF20 sub_005BC010";;
-  esac
+  F="$FLAGS"; case "$(basename "$src")" in "${BIGSTEM}"_part_*) F="$FLAGS $BIG_OPT";; esac
+  cc_src="$src"; wrap="$(awk -v s="$src" '$2 == s {print $1}' "$WRAPMAP" | tr '\n' ' ')"
   if [ -n "$wrap" ]; then
     cc_src="$GUEST_OUT/$(basename "$src" .c).wrap.c"
     cp "$src" "$cc_src"

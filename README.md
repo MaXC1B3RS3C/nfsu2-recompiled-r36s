@@ -156,18 +156,19 @@ Current state as of **October 2026**:
 
 ## Tested Game Build
 
-| Property | Details |
-|---|---|
-| **Required Binary** | `SPEED2.EXE` (European / Multi-Language v1.2 No-CD) |
-| **Exact File Size** | `4,788,224` bytes (~4.57 MB) |
-| **SHA-256 Checksum** | `04b83e2d13c91c6ec294b578a08240ebcfff6fa9513df584edaa968e4ab9990c` |
-| **MD5 Checksum** | `95b4dc3e9a6c72b06a8bd62b0c56ea63` |
-| **PE Entry Point** | `0x0075B9F1` (RVA `0x35B9F1`) |
-| **Embedded Date** | `Feb 9 2005` (online `VERS` field) |
-| **Binary Format** | Unpacked image (`.text` clean code, rebuilt imports, relocations preserved) |
+The port can be built from either of these unpacked (No-CD) `SPEED2.EXE` builds: the original release (v1.0) and the final patch (v1.2), which is the same code plus the patch changes, relinked. Functions sit at different offsets, so each build is lifted from its own exe, and the hand-written native code, hooks and overrides take that exe's addresses automatically (`config/exe_variants.txt`, `config/exe_functions.txt`).
+
+| Property | v10 | v12 |
+|---|---|---|
+| **What it is** | v1.0 (`Oct 17 2004`), the exe this port was first lifted from (region unconfirmed) | v1.2 (`Feb 9 2005`), European retail with SecuROM removed |
+| **Exact File Size** | `4,788,224` bytes | `4,800,512` bytes |
+| **SHA-256** | `04b83e2d13c91c6ec294b578a08240ebcfff6fa9513df584edaa968e4ab9990c` | `f9dd86c054878ce6276beb07c1fd61874f7a1e4bf1f241b084c65b73e24168a7` |
+| **MD5** | `95b4dc3e9a6c72b06a8bd62b0c56ea63` | `6445adbf4e8d64be51e96a69bba168a4` |
+| **PE Entry Point** | `0x0075B9F1` | `0x0075BCC7` |
+| **Binary Format** | Unpacked image (`.text` clean code, rebuilt imports, relocations preserved) | same |
 
 > [!IMPORTANT]
-> Because this is a native static recompilation, the lifted ARM64/x86 code is compiled against the exact memory offsets of this European v1.2 executable. Do not use the US v1.2 executable (4,800,512 bytes) or unpatched v1.0/v1.1 binaries, as internal memory layouts differ.
+> A build runs only with the exe it was lifted from: `scripts/run_lift.py` recognises the exe by its hash, and the launcher and runtime refuse a different one (an exe of the other build would run its data into the wrong code). Other builds (another v1.0 exe, v1.1) are not supported unless they match one of these hashes.
 
 *For deep binary details, see [docs/NFSU2_BINARY_REPORT.md](docs/NFSU2_BINARY_REPORT.md).*
 
@@ -175,21 +176,16 @@ Current state as of **October 2026**:
 
 ## Requirements
 
+For the **R36S binary** you only need Python and Docker on Windows, macOS or Linux: see
+[R36S Handheld & PortMaster Port](#r36s-handheld--portmaster-port) and [BUILD.md](BUILD.md). The
+requirements below are for the native Windows x86 host build.
+
 ### Windows Host
 - Windows 10 / 11 64-bit
 - Visual Studio 2022 / 2026 with C++ x86 desktop development toolset (MSVC)
 - LLVM / Clang (for differential testing)
-- Python 3.10+ with dependencies:
-  ```bash
-  pip install capstone pefile unicorn keystone-engine
-  ```
-- Enhanced pcrecomp submodule with patches 0001–0011 applied:
-  ```bash
-  git clone https://github.com/sp00nznet/pcrecomp.git ../pcrecomp
-  cd ../pcrecomp
-  git checkout 35548b8
-  git am ../nfsu2-recompiled/patches/pcrecomp/*.patch
-  ```
+- The lifting programs of [Lifting the Functions](#lifting-the-functions-windows-macos-linux) (Python 3.8+,
+  git, capstone, pefile); `unicorn` and `keystone-engine` only for pcrecomp's differential tests
 
 ### Android Build
 - Android SDK Platform 35 / Min SDK 26 (Android 8.0+)
@@ -198,29 +194,73 @@ Current state as of **October 2026**:
 
 ---
 
-## Pipeline
+## Lifting the Functions (Windows, macOS, Linux)
 
-Follow these steps to generate the C code and build the executable:
+Lifting turns the x86 code of your `SPEED2.EXE` into C (`src/recomp/gen/`, about 27,700 functions and
+9 million lines). It is plain Python and runs natively on **Windows, macOS and Linux** with one command,
+without Docker or a compiler:
 
 ```bash
-# 1. Initialize MSVC x86 environment in Git Bash
-source scripts/vsenv.sh x86
+python build.py "<your game folder or SPEED2.EXE>" --lift-only                     # R36S / Android x87 data included
+python build.py "<your game folder or SPEED2.EXE>" --lift-only --no-x87-window     # for the Windows x86 host build
+```
+
+(`python3` on macOS and Linux.) It recognises the exe (v1.0 or v1.2, `config/exe_variants.txt`), fetches the
+pcrecomp lifter at commit `35548b8` and applies `patches/pcrecomp/`, then runs the analysis copy, the
+vtable/RTTI seeds, the function catalog (5–15 min), the lift (~3 min) and, unless `--no-x87-window`, the
+local x87 window data the R36S and Android builds use. Results are cached in the work folder
+(`%LOCALAPPDATA%\nfsu2-r36s` on Windows, `~/.cache/nfsu2-r36s` elsewhere; `--work` changes it), so a second
+run with the same exe and lifter is instant. Output: `src/recomp/gen/` (`--gen` changes it).
+
+### Programs needed for lifting
+
+| | Windows 10/11 | macOS 12+ | Linux |
+|---|---|---|---|
+| **Python 3.8+** | [python.org](https://www.python.org/downloads/) (tick *Add python.exe to PATH*) or `winget install Python.Python.3.12` | `brew install python` or `xcode-select --install` | preinstalled; Debian/Ubuntu: `sudo apt install python3 python3-pip` |
+| **git** | `winget install Git.Git` ([git-scm.com](https://git-scm.com/download/win)) | `xcode-select --install` or `brew install git` | `sudo apt install git` / `sudo dnf install git` / `sudo pacman -S git` |
+| **capstone 5, pefile** | `py -m pip install "capstone>=5.0,<6" pefile` | `python3 -m pip install "capstone>=5.0,<6" pefile` | `python3 -m pip install --user "capstone>=5.0,<6" pefile` (add `--break-system-packages` on Debian 12 / Ubuntu 24.04, or use a venv) |
+| **Disk / RAM** | 3 GB / 4 GB | 3 GB / 4 GB | 3 GB / 4 GB |
+
+`python build.py --setup-lifter` only fetches and patches the lifter (a quick check that git works).
+Compiling the lifted code for the R36S needs the ARM64 toolchain: `build.py` without `--lift-only` does the
+lift and the compile in Docker on all three systems ([R36S Handheld & PortMaster Port](#r36s-handheld--portmaster-port)).
+
+### The steps by hand
+
+The same steps without `build.py`, from the repository folder (bash; in PowerShell use `$env:GAME` and
+backticks instead of `\`):
+
+```bash
 GAME="/path/to/Need for Speed Underground 2"
+git clone https://github.com/sp00nznet/pcrecomp.git ../pcrecomp
+git -C ../pcrecomp checkout 35548b8
+git -C ../pcrecomp am --3way "$PWD"/patches/pcrecomp/*.patch
+cp ports/r36s/sdk/include/recomp32/*.h ports/r36s/sdk/include/recomp32/*.c ../pcrecomp/runtime/recomp32/
 
-# 2. Normalize executable (restores relocation directory without modifying original)
-python scripts/normalize_exe.py "$GAME/SPEED2.EXE" work/SPEED2.analysis.exe
-
-# 3. Scan seeds: vtables and RTTI
+python scripts/exe_variant.py detect "$GAME/SPEED2.EXE"                       # v10 or v12
+python scripts/normalize_exe.py "$GAME/SPEED2.EXE" work/SPEED2.analysis.exe   # analysis copy (relocations restored)
 python ../pcrecomp/tools/cpp/vtable_scan.py work/SPEED2.analysis.exe --seeds work/vtable_seeds.json
 python ../pcrecomp/tools/cpp/rtti.py        work/SPEED2.analysis.exe --seeds work/rtti_seeds.json
-
-# 4. Generate function catalog with basic blocks (~5 min)
+python -c "import json;a=json.load(open('work/vtable_seeds.json'));b=json.load(open('work/rtti_seeds.json'));json.dump(a+b,open('work/seeds_all.json','w'))"
 python scripts/run_lift.py catalog work/SPEED2.analysis.exe work/seeds_all.json work/catalog.json
+python scripts/run_lift.py lift    work/SPEED2.analysis.exe work/catalog.json src/recomp/gen
+# R36S / Android only: local x87 window data
+python ports/r36s/lw/annotate.py strip src/recomp/gen
+python ports/r36s/lw/analyze.py src/recomp/gen work/nfs_lw_info.json
+python ports/r36s/lw/annotate.py apply src/recomp/gen work/nfs_lw_info.json
+python ports/r36s/lw/annotate.py header src/recomp/gen work/nfs_lw_info.json src/recomp/gen/nfs_lw.h
+```
 
-# 5. Lift assembly to portable C (~90 s) -> src/recomp/gen/
-python scripts/run_lift.py lift work/SPEED2.analysis.exe work/catalog.json src/recomp/gen
+`run_lift.py` uses the exe's column of `config/hooks.txt`, `overrides.txt` and `exclude.txt` and records the
+exe in the generated code; the hand-written native code follows it through `src/runtime/nfs_exe_addr.h`.
 
-# 6. Build and run native Windows host
+### Windows x86 host build
+
+After `python build.py "<game>" --lift-only --no-x87-window`, in Git Bash with Visual Studio 2022 (C++ x86
+desktop tools):
+
+```bash
+source scripts/vsenv.sh x86
 scripts/build.sh
 scripts/run.sh [--fullscreen]
 ```
@@ -251,19 +291,62 @@ See additional documentation:
 
 ## R36S Handheld & PortMaster Port
 
-The `ports/r36s/` directory contains the complete build and packaging setup for the **R36S** and compatible ARM64 handheld consoles (Rockchip RK3326) running ArkOS, AmberELEC, or ROCKNIX via PortMaster:
+The `ports/r36s/` directory contains the build and packaging for the **R36S** and compatible ARM64 handhelds
+(Rockchip RK3326) running ArkOS, dArkOS, AmberELEC or ROCKNIX through PortMaster.
 
-1. **Building the Binary**:
-   ```bash
-   bash ports/r36s/build_r36s.sh
-   ```
-2. **Device Deployment**:
-   - Copy `ports/r36s/package/NFSU2.sh` to `/roms/ports/` on your SD card.
-   - Copy the folder `ports/r36s/package/` into `/roms/ports/nfsu2/`.
-   - Copy your retail PC game files into `/roms/ports/nfsu2/gamedata/`.
-   - Launch **Need for Speed Underground 2** from your device's Ports menu!
+Every [release](https://github.com/manuelpllull/nfsu2-recompiled-r36s/releases) contains ready-to-run
+binaries for both supported exes, `nfsu2.aarch64.v10` (v1.0) and `nfsu2.aarch64.v12` (v1.2); the launcher
+picks the one for the player's `SPEED2.EXE`:
 
-See additional documentation:
+1. Unzip the release `NFSU2-R36S-<version>.zip` into the SD card's `ports/` folder (`NFSU2.sh` + `nfsu2/`).
+2. Copy your game files, with an unpacked v1.0 or v1.2 `SPEED2.EXE`, into `ports/nfsu2/gamedata/`.
+3. Launch **Need for Speed Underground 2** from the Ports menu.
+
+To build the binary yourself, use **`build.py`**, one command on Windows, macOS or Linux; the full guide
+is **[BUILD.md](BUILD.md)**. Maintainers produce the release binaries with it too (BUILD.md, section 8).
+
+### What you need to build it
+
+| | Windows 10/11 | macOS 12+ (Apple silicon or Intel) | Linux |
+|---|---|---|---|
+| **Container** | [Docker Desktop](https://www.docker.com/products/docker-desktop/) (WSL 2 backend) or `winget install Docker.DockerDesktop` | [Docker Desktop](https://www.docker.com/products/docker-desktop/) or `brew install --cask docker`, 8 GB memory in *Settings > Resources* | [Docker Engine](https://docs.docker.com/engine/install/) (`sudo apt install docker.io`), user in the `docker` group |
+| **Python 3.8+** | [python.org](https://www.python.org/downloads/) or `winget install Python.Python.3.12` | `xcode-select --install` or `brew install python` | preinstalled (`python3`) |
+| **Without Docker** | inside WSL 2 Ubuntu, as Linux | – | Ubuntu 22.04 / Debian 12: `gcc-aarch64-linux-gnu g++-aarch64-linux-gnu binutils-aarch64-linux-gnu python3-pip git`, then `pip install capstone pefile` (see BUILD.md) |
+
+Plus: 8 GB RAM (16 GB recommended), 10 GB of free disk, internet for the first build, and one of the
+supported exes (section *Tested Game Build* above). The retail SecuROM exe cannot be lifted.
+
+### Build and install
+
+```bash
+git clone https://github.com/manuelpllull/nfsu2-recompiled-r36s.git
+cd nfsu2-recompiled-r36s
+
+python build.py "C:\Games\Need for Speed Underground 2" --check     # Windows: is the exe supported, is Docker ready?
+python build.py "C:\Games\Need for Speed Underground 2"             # Windows
+python3 build.py ~/Games/NFSU2/SPEED2.EXE                            # macOS / Linux
+python3 build.py ~/Games/NFSU2/SPEED2.EXE --native                   # Linux without Docker
+```
+
+The first build takes about 30 minutes on a 12-core PC (lift, then compiling ~9 million lines of C); later
+builds reuse the cached work. The result is `build/r36s/nfsu2-<v10|v12>.aarch64`: copy it to
+`ports/nfsu2/nfsu2.aarch64`, or let `build.py --install <SD card>/ports/nfsu2` do it.
+
+**Release binaries (maintainers).** The game exes cannot be in the repository or in CI, so the release
+workflow links its binaries from compiled game code exported on a PC with both exes:
+
+```bash
+python build.py "<v1.0 SPEED2.EXE>" "<v1.2 SPEED2.EXE>" --publish     # needs the GitHub CLI (gh auth login)
+```
+
+This builds both, writes `guest-objs-v10.tar.gz` and `guest-objs-v12.tar.gz` and uploads them to the
+release `r36s-guest-objs`. The workflow (`.github/workflows/release.yml`) checks they were compiled from the
+release commit's source (`scripts/guest_key.py`), compiles the runtime and links `nfsu2.aarch64.v10` and
+`nfsu2.aarch64.v12` into the package. Run it again whenever the lift or the guest compile inputs change
+(the release stops with a message saying so).
+
+See also:
+- [BUILD.md](BUILD.md): every step, options, troubleshooting, lifting by hand
 - [R36S Port Architecture & Technical Guide](docs/R36S_PORT.md)
 - [PortMaster Package & Controls Setup](ports/r36s/package/README.md)
 

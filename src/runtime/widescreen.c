@@ -18,6 +18,7 @@
  * read from <game>/scripts/ when present (the player supplies the mod).
  */
 #include "recomp_types.h"
+#include "nfs_exe_addr.h"   /* v10 addresses -> the lifted exe's (config/exe_functions.txt) */
 #include "nfs_widescreen.h"
 #include <math.h>
 #include <stdlib.h>
@@ -128,8 +129,9 @@ void nfs_widescreen_set_resolution(unsigned width, unsigned height) {
     s_hud_pos_x = 640.0f / (640.0f * hud_scale_x);
     /* HudAspectRatioConstraint = Auto: -CalculateWidescreenOffset(W, H, 640, 480). */
     s_hud_offset = -((640.0f / 2.0f) - (480.0f / 2.0f) * s_aspect);
-    wrf(0x0079AC0Cu, hud_scale_x);              /* fld [fHudScaleX] (EU) */
-    wrf(0x0079AC10u, hud_scale_x);              /* fld [fHudScaleX] (US) */
+    wrf(NFS_VA(0x0079AC0C), hud_scale_x);       /* fld [fHudScaleX]: 0x79AC0C in v10, 0x79AC10 in v12.
+                                                   Writing both addresses clobbered the neighbouring
+                                                   constant of whichever exe was running. */
     wrf(0x00797D50u, s_hud_pos_x);              /* fsub [fHudPosX] */
     wrf(0x00797D58u, s_hud_pos_x * 2.0f);       /* fmul [fHudPosX_x2] */
     /* Dyno result graph origin (float[2]). */
@@ -219,134 +221,111 @@ static float anchor_x(int idx) {
 }
 
 void recomp_hook(uint32_t va) {
-    if (!s_enabled && va != 0x005D2962u && va != 0x005D2C12u) return;
+    if (!s_enabled && va != NFS_VA(0x005D2962)) return;
     { static int t = -1; static uint32_t seen[64]; static int ns;
       if (t < 0) t = getenv("NFSU2_WS_TRACE") != NULL;
       if (t) { int k; for (k = 0; k < ns && seen[k] != va; ++k) ; if (k == ns && ns < 64) { seen[ns++] = va; printf("[WS] hook %08x esp=%08x\n", va, g_esp); fflush(stdout); } } }
     switch (va) {
     /* HUD anchors: `mov [esp+N], 320.0` -> fHudPosX (pattern offsets 4/7). */
-    case 0x0051B05Fu:
-    case 0x0051B3CFu:
+    case NFS_VA(0x0051B05F):
         set_esp_float(0xA0, s_hud_pos_x);
         break;
 
-    case 0x0053655Cu:
-    case 0x005368CCu:
+    case NFS_VA(0x0053655C):
         set_esp_float(0x74, anchor_x(0));
         break;
 
-    case 0x0053672Du:
-    case 0x00536A9Du:
+    case NFS_VA(0x0053672D):
         set_esp_float(0x84, anchor_x(1));
         break;
 
-    case 0x0053695Du:
-    case 0x00536CCDu:
+    case NFS_VA(0x0053695D):
         set_esp_float(0x94, anchor_x(2));
         break;
 
-    case 0x00536CA5u:
-    case 0x00537015u:
+    case NFS_VA(0x00536CA5):
         set_esp_float(0x74, anchor_x(3));
         break;
 
-    case 0x0050B099u:
-    case 0x0050B4F9u:
+    case NFS_VA(0x0050B099):
         set_esp_float(0x1A0, s_hud_pos_x);
         break;
 
-    case 0x0048B5D4u:
-    case 0x0048B644u:
+    case NFS_VA(0x0048B5D4):
         wrf(0x0082D2D8u, s_hud_pos_x);
         break;
 
     /* Rear-view mirror quad: 440/200 shifted with the HUD centre. */
-    case 0x005CBDCDu:
-    case 0x005CC0FDu:
+    case NFS_VA(0x005CBDCD):
         set_esp_float(0x30, (s_hud_pos_x - 320.0f) + 440.0f);
         break;
 
-    case 0x005CBDDDu:
-    case 0x005CC10Du:
+    case NFS_VA(0x005CBDDD):
         set_esp_float(0x40, (s_hud_pos_x - 320.0f) + 200.0f);
         break;
 
-    case 0x005CBDEDu:
-    case 0x005CC11Du:
+    case NFS_VA(0x005CBDED):
         set_esp_float(0x50, (s_hud_pos_x - 320.0f) + 200.0f);
         break;
 
-    case 0x005CBDFDu:
-    case 0x005CC12Du:
+    case NFS_VA(0x005CBDFD):
         set_esp_float(0x60, (s_hud_pos_x - 320.0f) + 440.0f);
         break;
 
     /* Cutscene letterbox quads (DisableCutsceneBorders = 1). */
-    case 0x005CBBC9u:
-    case 0x005CBEF9u:
+    case NFS_VA(0x005CBBC9):
         set_esp_float(0x38, s_disable_cutscene_borders ? 0.0f : s_width);
         break;
 
-    case 0x005CBBD9u:
-    case 0x005CBF09u:
+    case NFS_VA(0x005CBBD9):
         set_esp_float(0x48, s_disable_cutscene_borders ? 0.0f : s_width);
         break;
 
-    case 0x005CBB5Du:
-    case 0x005CBE8Du:
+    case NFS_VA(0x005CBB5D):
         set_esp_float(0x2C, s_disable_cutscene_borders ? 0.0f : s_width);
         break;
 
-    case 0x005CBB75u:
-    case 0x005CBEA5u:
+    case NFS_VA(0x005CBB75):
         set_esp_float(0x3C, s_disable_cutscene_borders ? 0.0f : s_width);
         break;
 
     /* Radar mask covers the whole render target. */
-    case 0x005C6F3Eu:
-    case 0x005C726Eu:
+    case NFS_VA(0x005C6F3E):
         set_esp_float(0x30, s_width * 2.0f);
         break;
 
-    case 0x005C6F4Eu:
-    case 0x005C727Eu:
+    case NFS_VA(0x005C6F4E):
         set_esp_float(0x40, s_width * 2.0f);
         break;
 
-    case 0x005C6F56u:
-    case 0x005C7286u:
+    case NFS_VA(0x005C6F56):
         set_esp_float(0x44, s_height * 2.0f);
         break;
 
-    case 0x005C6F66u:
-    case 0x005C7296u:
+    case NFS_VA(0x005C6F66):
         set_esp_float(0x54, s_height * 2.0f);
         break;
 
     /* HudHook: the element position just stored from ecx/edx. */
-    case 0x0051AE28u:
-    case 0x0051B198u:
+    case NFS_VA(0x0051AE28):
         adjust_mem_pair(g_esp + 0x60, g_esp + 0x64);
         break;
 
     /* BlipsHook: radar blips, before `mov [edx], ecx`. */
-    case 0x0051D2E5u:
-    case 0x0051D655u:
+    case NFS_VA(0x0051D2E5):
         adjust_mem_pair(g_ebx + 0x1C, g_ebx + 0x20);
         g_ecx = MEM32(g_ebx + 0x1C);
         break;
 
     /* HudHook2: ecx = adjusted X of [esi+1C]/[esi+20]. */
-    case 0x004C6589u:
-    case 0x004C6759u: {
+    case NFS_VA(0x004C6589): {
         float x, y; uint32_t v = g_ecx; memcpy(&x, &v, 4); y = rdf(g_esi + 0x20);
         widescreen_hud(&x, &y); memcpy(&v, &x, 4); g_ecx = v;
         break;
     }
 
     /* StopSignHook: [esi] was ST0 + [edx]; make it ST0 + adjusted [edx]. */
-    case 0x00504D5Fu:
-    case 0x0050516Fu: {
+    case NFS_VA(0x00504D5F): {
         float x = rdf(g_edx), y = rdf(g_edx + 4), original = x;
         widescreen_hud(&x, &y);
         wrf(g_esi, rdf(g_esi) + (x - original));
@@ -355,34 +334,33 @@ void recomp_hook(uint32_t va) {
 
     /* FMV / loading-screen quads: the four model half-extents (x0,y0,x1,y1) at
      * the top of the stack, consumed by sub_00519E50.  See fmv_extents(). */
-    case 0x005366C2u:   /* sub_005364E0: EA Games and THX logos */
-    case 0x005368E6u:   /* sub_005366E0: NFSU2 title card and loading screens */
-    case 0x00536BD1u:   /* sub_00536910 */
+    case NFS_VA(0x005366C2):   /* sub_005364E0: EA Games and THX logos */
+    case NFS_VA(0x005368E6):   /* sub_005366E0: NFSU2 title card and loading screens */
+    case NFS_VA(0x00536BD1):   /* sub_00536910 */
         fmv_extents();
         break;
 
     /* The same quad's position Y, right after the game stored (320,240,0) and
      * just before sub_0051AD40 turns it into the matrix.  See fmv_center_y(). */
-    case 0x0053656Cu:   /* sub_005364E0: EA Games / THX */
+    case NFS_VA(0x0053656C):   /* sub_005364E0: EA Games / THX */
         fmv_center_y(0x78);
         break;
 
-    case 0x00536743u:   /* sub_005366E0: title card / loading screens */
+    case NFS_VA(0x00536743):   /* sub_005366E0: title card / loading screens */
         fmv_center_y(0x88);
         break;
 
-    case 0x00536973u:   /* sub_00536910 */
+    case NFS_VA(0x00536973):   /* sub_00536910 */
         fmv_center_y(0x98);
         break;
 
-    case 0x00536CB5u:   /* sub_00536BF0 */
+    case NFS_VA(0x00536CB5):   /* sub_00536BF0 */
         fmv_center_y(0x78);
         break;
 
     /* FixFOV: ST0 was viewport height/width; the mod loads a per-view scale
      * and picks the constants of the three later reads by view id (ecx). */
-    case 0x005C7C34u:
-    case 0x005C7F64u: {
+    case NFS_VA(0x005C7C34): {
         uint32_t view = g_ecx;
         double hor = 1.0 / (s_aspect / (4.0 / 3.0));
         if (view == 1 || view == 4) { s_fov_scale[0] = hor; s_fov_scale[1] = 0.43511; s_fov_scale[2] = 1.22; }
@@ -392,24 +370,20 @@ void recomp_hook(uint32_t va) {
     }
 
     /* `fdivr [1.0]`, `fmul [0.5]`, `fdivr [1.0]`: rescale by new/original. */
-    case 0x005C7CBEu:
-    case 0x005C7FEEu:
+    case NFS_VA(0x005C7CBE):
         g_st[0] *= s_fov_scale[0] / rdf(0x00784250u);
         break;
 
-    case 0x005C7CD0u:
-    case 0x005C8000u:
+    case NFS_VA(0x005C7CD0):
         g_st[0] *= s_fov_scale[1] / rdf(0x00784260u);
         break;
 
-    case 0x005C7CF5u:
-    case 0x005C8025u:
+    case NFS_VA(0x005C7CF5):
         g_st[0] *= s_fov_scale[2] / rdf(0x00784250u);
         break;
 
     /* FPSLimit: eDisplayFrame pushes 1/60 s as the particle step. */
-    case 0x005D2962u:
-    case 0x005D2C12u:
+    case NFS_VA(0x005D2962):
         if (s_frame_time > 0.0f) set_esp_float(0x0, s_frame_time);
         break;
 

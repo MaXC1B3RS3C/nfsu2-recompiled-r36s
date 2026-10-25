@@ -22,6 +22,7 @@
  *                 through the guest scheduler's checkpoint on every physics substep).
  */
 #include "recomp_types.h"
+#include "nfs_exe_addr.h"   /* v10 addresses -> the lifted exe's (config/exe_functions.txt) */
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>

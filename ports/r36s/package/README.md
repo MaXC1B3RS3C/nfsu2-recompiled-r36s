@@ -12,13 +12,14 @@ Copy the files to your SD card (either `TF1` or `TF2/EASYROMS`) under the `ports
 /roms/ports/
 ├── NFSU2.sh                        <- Launcher script
 └── nfsu2/                          <- Game folder
-    ├── nfsu2.aarch64               <- Native ARM64 binary executable
+    ├── nfsu2.aarch64.v10           <- game binary for SPEED2.EXE v1.0 (included)
+    ├── nfsu2.aarch64.v12           <- game binary for SPEED2.EXE v1.2 (included)
     ├── port.json                   <- PortMaster metadata
     ├── nfsu2.gptk                  <- Gamepad mapping profile
     ├── libs/                       <- Bundled runtime libraries (libSDL2, etc.)
     ├── widescreen/                 <- HUD layout for wide screens (ThirteenAG's widescreen fix, MIT)
     └── gamedata/                   <- YOUR PC GAME FILES GO HERE
-        ├── SPEED2.EXE              <- European v1.2 No-CD executable (exactly 4,788,224 bytes)
+        ├── SPEED2.EXE              <- unpacked v1.0 or v1.2 exe (see below)
         ├── GLOBAL/                 <- Global assets (GLOBALB.BUN, etc.)
         ├── CARS/                   <- Car models, textures, vinyls
         ├── TRACKS/                 <- City tracks and collision data
@@ -31,12 +32,25 @@ Copy the files to your SD card (either `TF1` or `TF2/EASYROMS`) under the `ports
 > [!IMPORTANT]
 > **No copyrighted game assets are bundled.** You must provide your own legitimate retail PC copy of Need for Speed: Underground 2.
 >
-> **Required Executable**:
-> * Must be **v1.2 European / Multi-Language No-CD**
-> * Exact File Size: **`4,788,224 bytes`** (~4.57 MB)
-> * MD5: `95b4dc3e9a6c72b06a8bd62b0c56ea63`
-> * SHA-256: `04b83e2d13c91c6ec294b578a08240ebcfff6fa9513df584edaa968e4ab9990c`
-> * *Note: Do not use the US v1.2 binary (4,800,512 bytes) or v1.0/v1.1, as static code offsets differ.*
+> **Required Executable**: an unpacked (No-CD) `SPEED2.EXE`, v1.0 or v1.2. The release has a binary for each, and the launcher picks the one for your exe:
+> * **v10** (v1.0): `4,788,224 bytes`, MD5 `95b4dc3e9a6c72b06a8bd62b0c56ea63`, SHA-256 `04b83e2d13c91c6ec294b578a08240ebcfff6fa9513df584edaa968e4ab9990c`
+> * **v12** (European retail v1.2, SecuROM removed): `4,800,512 bytes`, MD5 `6445adbf4e8d64be51e96a69bba168a4`, SHA-256 `f9dd86c054878ce6276beb07c1fd61874f7a1e4bf1f241b084c65b73e24168a7`
+> * The retail `SPEED2.EXE` with SecuROM (5,987,978 bytes) does not work, nor do other builds (v1.1, other v1.0 dumps): the launcher stops with a message.
+
+---
+
+## 🛠️ Building `nfsu2.aarch64` yourself (optional)
+
+The release already contains the binaries for v1.0 and v1.2. To build one yourself (for example from a
+modified source), use `build.py` from the repository on Windows, macOS or Linux; see `BUILD.md` there:
+
+```bash
+python build.py "C:\Games\Need for Speed Underground 2" --install J:\ports\nfsu2     # Windows
+python3 build.py ~/Games/NFSU2/SPEED2.EXE --install /Volumes/EASYROMS/ports/nfsu2       # macOS / Linux
+```
+
+A self-built binary is installed as `nfsu2.aarch64`; the launcher uses it when there is no
+`nfsu2.aarch64.v10`/`.v12` for your exe.
 
 ---
 
